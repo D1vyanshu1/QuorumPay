@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package ledger.pb;
+
+// Messages on a node's client port. Ledger requests (SubmitTx, GetBalance, ...)
+// are added later; for now only the admin commands used by the test harness.
+
+message BlockPeer {
+  uint32 peer_id = 1;
+}
+
+message UnblockPeer {
+  uint32 peer_id = 1;
+}
+
+message UnblockAll {}
+
+message GetStatus {}
+
+message AdminResp {
+  bool ok = 1;
+  string error = 2;
+}
+
+message PeerStatus {
+  uint32 id = 1;
+  bool connected = 2;      // outbound TCP connection is up
+  bool reachable = 3;      // a Pong arrived recently (traffic flows both ways)
+  bool blocked = 4;        // FaultFilter is dropping this peer's traffic
+  uint64 last_rtt_us = 5;
+  int64 ms_since_pong = 6; // -1 = never received a Pong
+}
+
+message StatusResp {
+  uint32 node_id = 1;
+  repeated PeerStatus peers = 2;
+}

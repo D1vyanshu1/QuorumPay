@@ -1,0 +1,19 @@
+{
+  "cluster_id": "ledger-dev",
+  "nodes": [
+    {"id": 1, "host": "127.0.0.1", "peer_port": 7001, "client_port": 8001, "data_dir": "data/node-1"},
+    {"id": 2, "host": "127.0.0.1", "peer_port": 7002, "client_port": 8002, "data_dir": "data/node-2"},
+    {"id": 3, "host": "127.0.0.1", "peer_port": 7003, "client_port": 8003, "data_dir": "data/node-3"},
+    {"id": 4, "host": "127.0.0.1", "peer_port": 7004, "client_port": 8004, "data_dir": "data/node-4"},
+    {"id": 5, "host": "127.0.0.1", "peer_port": 7005, "client_port": 8005, "data_dir": "data/node-5"}
+  ],
+  "raft": {
+    "tick_ms": 10,
+    "election_ticks_min": 15,
+    "election_ticks_max": 30,
+    "heartbeat_ticks": 5,
+    "max_entries_per_append": 64,
+    "snapshot_every": 1000,
+    "fsync": "batch"
+  }
+}

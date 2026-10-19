@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package ledger.pb;
+
+// Node-to-node messages. Raft messages (RequestVote, AppendEntries, ...) are
+// added to raft.proto later; for now peers exchange only a handshake and a
+// ping/pong liveness probe.
+
+// First frame on every peer connection, sent by the dialing side.
+// The acceptor closes the connection if cluster_id doesn't match or node_id
+// isn't in its cluster config.
+message Hello {
+  uint32 node_id = 1;
+  string cluster_id = 2;
+}
+
+// Liveness probe. sent_us is the sender's monotonic clock; the receiver echoes
+// it back unchanged so the sender can compute RTT using only its own clock.
+message Ping {
+  uint64 seq = 1;
+  uint64 sent_us = 2;
+}
+
+message Pong {
+  uint64 seq = 1;
+  uint64 sent_us = 2;
+}

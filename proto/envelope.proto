@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package ledger.pb;
+
+import "peer.proto";
+import "client.proto";
+
+// Every frame on the wire carries exactly one Envelope, so a single parser
+// handles all traffic on both the peer port and the client port.
+message Envelope {
+  oneof msg {
+    // peer port
+    Hello hello = 1;
+    Ping ping = 2;
+    Pong pong = 3;
+
+    // client port: admin
+    BlockPeer block_peer = 20;
+    UnblockPeer unblock_peer = 21;
+    UnblockAll unblock_all = 22;
+    GetStatus get_status = 23;
+    AdminResp admin_resp = 24;
+    StatusResp status_resp = 25;
+  }
+}
