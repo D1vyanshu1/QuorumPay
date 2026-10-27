@@ -140,7 +140,12 @@ int main(int argc, char** argv) {
   if (resp.has_status_resp()) {
     // JSON so scripts can parse it.
     const auto& s = resp.status_resp();
-    nlohmann::json out = {{"node", s.node_id()}, {"peers", nlohmann::json::array()}};
+    nlohmann::json out = {{"node", s.node_id()},
+                          {"role", s.role()},
+                          {"term", s.term()},
+                          {"leader", s.leader()},
+                          {"last_log_index", s.last_log_index()},
+                          {"peers", nlohmann::json::array()}};
     for (const auto& p : s.peers()) {
       out["peers"].push_back({{"id", p.id()},
                               {"connected", p.connected()},

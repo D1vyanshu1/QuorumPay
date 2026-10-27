@@ -34,4 +34,8 @@ message PeerStatus {
 message StatusResp {
   uint32 node_id = 1;
   repeated PeerStatus peers = 2;
+  string role = 3;          // follower | candidate | leader
+  uint64 term = 4;
+  uint32 leader = 5;        // 0 = unknown
+  uint64 last_log_index = 6;
 }

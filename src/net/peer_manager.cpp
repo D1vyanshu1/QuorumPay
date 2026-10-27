@@ -163,6 +163,16 @@ bool PeerManager::handle_hello(Connection& conn, const pb::Envelope& msg) {
   }
   conn.set_peer_id(hello.node_id());
   log_info("peer_inbound", {{"peer", hello.node_id()}, {"remote", conn.remote()}});
+
+  // The peer just dialed us, so it is up again. If our own connection to it
+  // is still waiting out a backoff (up to kMaxBackoffMs after a long outage),
+  // dial now. Otherwise the restarted node can send but hears nothing from
+  // us; it then times out, starts elections and disrupts a healthy leader.
+  auto it = outbound_.find(hello.node_id());
+  if (it != outbound_.end() && !it->second.conn) {
+    it->second.backoff_ms = kMinBackoffMs;
+    dial(it->second, now_ms());
+  }
   return true;
 }
 

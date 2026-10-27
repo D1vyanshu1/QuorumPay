@@ -2,5 +2,60 @@ syntax = "proto3";
 
 package ledger.pb;
 
-// RequestVote, AppendEntries, InstallSnapshot, LogEntry.
-// Skeleton: filled in Week 2-3.
+// Raft messages exchanged between nodes. RaftCore produces and consumes these
+// directly; the node host only wraps them for the wire.
+
+enum EntryType {
+  ENTRY_NOOP = 0;    // appended by a new leader so it can commit earlier terms
+  ENTRY_NORMAL = 1;  // carries a client transaction in `data`
+}
+
+message LogEntry {
+  uint64 term = 1;
+  uint64 index = 2;
+  EntryType type = 3;
+  bytes data = 4;
+}
+
+// Sent by a candidate. Granted only if the candidate's log is at least as up
+// to date as the voter's: compare last_log_term first, then last_log_index.
+message RequestVote {
+  uint64 last_log_index = 1;
+  uint64 last_log_term = 2;
+  bool pre_vote = 3;  // reserved for pre-vote (week 6)
+}
+
+message RequestVoteResp {
+  bool granted = 1;
+  bool pre_vote = 2;
+}
+
+// Replication + heartbeat. With no entries it is a heartbeat that tells
+// followers the leader is alive and resets their election timers.
+message AppendEntries {
+  uint64 prev_log_index = 1;
+  uint64 prev_log_term = 2;
+  repeated LogEntry entries = 3;
+  uint64 leader_commit = 4;
+}
+
+message AppendEntriesResp {
+  bool success = 1;
+  uint64 match_index = 2;     // last index known to match the leader (on success)
+  uint64 conflict_index = 3;  // fast-backtracking hint (on failure, week 3)
+  uint64 conflict_term = 4;
+}
+
+// Every Raft message carries the sender's current term. Any node that sees a
+// higher term than its own immediately steps down to follower at that term.
+message RaftMessage {
+  uint32 from = 1;
+  uint32 to = 2;
+  uint64 term = 3;
+  oneof body {
+    RequestVote request_vote = 10;
+    RequestVoteResp request_vote_resp = 11;
+    AppendEntries append_entries = 12;
+    AppendEntriesResp append_entries_resp = 13;
+  }
+}

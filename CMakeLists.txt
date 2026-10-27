@@ -146,9 +146,10 @@ if(LEDGER_BUILD_TESTS)
     tests/unit/peer_manager_test.cpp
     tests/unit/crypto_test.cpp
     tests/unit/state_machine_test.cpp
-    tests/unit/wal_test.cpp)
+    tests/unit/wal_test.cpp
+    tests/unit/raft_core_test.cpp)
   target_link_libraries(unit_tests PRIVATE
-    ledger_net ledger_ledger ledger_storage GTest::gtest_main ledger_warnings)
+    ledger_net ledger_ledger ledger_storage ledger_raft GTest::gtest_main ledger_warnings)
   target_compile_definitions(unit_tests PRIVATE LEDGER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   gtest_discover_tests(unit_tests)
 

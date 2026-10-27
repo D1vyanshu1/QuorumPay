@@ -2,7 +2,7 @@
 """Start, stop, kill and partition a local ledger cluster.
 
     tools/cluster.py start              # all nodes (or: start 1 3)
-    tools/cluster.py status             # one line per node, from ledger-admin
+    tools/cluster.py status             # role/term/leader + peer links per node
     tools/cluster.py kill 3             # SIGKILL: simulates a crash
     tools/cluster.py restart 3
     tools/cluster.py partition 1,2 3,4,5
@@ -132,7 +132,9 @@ def print_status(cluster):
             mark = "ok" if p["reachable"] else ("blocked" if p["blocked"] else "--")
             rtt = f" {p['rtt_us']}us" if p["reachable"] else ""
             parts.append(f"{p['id']}:{mark}{rtt}")
-        print(f"node {nid}: " + "  ".join(parts))
+        leader = s["leader"] or "?"
+        raft = f"{s['role']:<9} term {s['term']:<3} leader {leader}"
+        print(f"node {nid}: {raft} | peers " + "  ".join(parts))
 
 
 def parse_ids(args):

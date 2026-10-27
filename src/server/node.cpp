@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <csignal>
+#include <random>
 #include <stdexcept>
 #include <utility>
 
@@ -13,11 +14,29 @@
 namespace ledger {
 
 Node::Node(ClusterConfig config, NodeId self)
-    : config_(std::move(config)), self_(self), peers_(loop_, config_, self_, faults_) {
+    : config_(std::move(config)),
+      self_(self),
+      peers_(loop_, config_, self_, faults_),
+      // Nothing on disk yet (week 5 loads HardState + log here). Note raft_ is
+      // declared before hard_state_/log_, so it must not read them here.
+      raft_(make_raft_config(), raft::HardState{}, {}) {
   if (config_.find(self_) == nullptr) {
     throw std::runtime_error("node id " + std::to_string(self_) + " not in cluster config");
   }
   for (NodeId id : peers_.peer_ids()) health_[id] = PeerHealth{};
+}
+
+raft::RaftConfig Node::make_raft_config() const {
+  raft::RaftConfig rc;
+  rc.id = self_;
+  rc.peers = peers_.peer_ids();
+  rc.election_timeout_min = static_cast<int>(config_.raft.election_ticks_min);
+  rc.election_timeout_max = static_cast<int>(config_.raft.election_ticks_max);
+  rc.heartbeat_interval = static_cast<int>(config_.raft.heartbeat_ticks);
+  // Real nodes want different timeouts on every run; only the simulator needs
+  // reproducible seeds.
+  rc.seed = (static_cast<uint64_t>(std::random_device{}()) << 32) ^ self_;
+  return rc;
 }
 
 void Node::run() {
@@ -69,6 +88,38 @@ void Node::on_tick() {
   peers_.tick(now);
   if (tick_count_ % config_.raft.heartbeat_ticks == 0) send_pings();
   update_reachability(now);
+
+  raft_.tick();
+  process_ready();
+}
+
+// The host half of the Ready contract: persist first, then send. Persisting
+// is in memory for now; week 5 makes it a write + fsync, and because the
+// order is already right here nothing else has to change.
+void Node::process_ready() {
+  if (!raft_.has_ready()) return;
+  raft::Ready rd = raft_.ready();
+
+  if (rd.hard_state) hard_state_ = *rd.hard_state;
+  for (auto& e : rd.entries) log_.push_back(std::move(e));
+
+  for (auto& m : rd.messages) {
+    NodeId to = m.to();
+    pb::Envelope env;
+    *env.mutable_raft() = std::move(m);
+    peers_.send(to, env);  // may drop (down, blocked); Raft copes with loss
+  }
+
+  if (raft_.role() != logged_role_ || raft_.term() != logged_term_ ||
+      raft_.leader() != logged_leader_) {
+    logged_role_ = raft_.role();
+    logged_term_ = raft_.term();
+    logged_leader_ = raft_.leader();
+    log_info("raft_state", {{"role", raft::role_name(logged_role_)},
+                            {"term", logged_term_},
+                            {"leader", logged_leader_},
+                            {"last_log_index", raft_.log().last_index()}});
+  }
 }
 
 void Node::send_pings() {
@@ -107,6 +158,16 @@ void Node::on_peer_message(NodeId from, const pb::Envelope& msg, net::Connection
       h.last_rtt_us = now_us() - msg.pong().sent_us();
       break;
     }
+    case pb::Envelope::kRaft:
+      // `from` is the peer authenticated by the Hello handshake; a message
+      // claiming to be from someone else is a bug or a misrouted frame.
+      if (msg.raft().from() != from || msg.raft().to() != self_) {
+        log_warn("raft_misrouted", {{"peer", from}, {"claims_from", msg.raft().from()}});
+        break;
+      }
+      raft_.step(msg.raft());
+      process_ready();
+      break;
     default:
       log_warn("unexpected_peer_message", {{"peer", from}, {"type", msg.msg_case()}});
   }
@@ -170,6 +231,10 @@ pb::Envelope Node::handle_admin(const pb::Envelope& req) {
 pb::StatusResp Node::build_status() const {
   pb::StatusResp s;
   s.set_node_id(self_);
+  s.set_role(raft::role_name(raft_.role()));
+  s.set_term(raft_.term());
+  s.set_leader(raft_.leader());
+  s.set_last_log_index(raft_.log().last_index());
   uint64_t now = now_ms();
   for (const auto& [id, h] : health_) {
     pb::PeerStatus* p = s.add_peers();

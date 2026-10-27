@@ -191,3 +191,21 @@ TEST_F(PeerManagerTest, WrongClusterIdIsRejected) {
       500);
   EXPECT_TRUE(received_.empty());
 }
+
+TEST_F(PeerManagerTest, RedialsAtOnceWhenRestartedPeerSaysHello) {
+  ASSERT_TRUE(run_until([this] { return fully_connected(); }));
+
+  // Keep node 3 down long enough for 1 and 2 to back off to the 1s maximum.
+  pms_[2].reset();
+  run_until([] { return false; }, 2500);
+  ASSERT_FALSE(pm(1).is_connected(3));
+
+  pms_[2] = std::make_unique<PeerManager>(loop_, config_, 3, filter(3));
+  pms_[2]->start();
+  // Node 3 dials 1 and 2 immediately; their Hello must trigger the redial
+  // back, well before a 1s backoff would have.
+  uint64_t start = now_ms();
+  ASSERT_TRUE(run_until([this] { return fully_connected(); }));
+  EXPECT_LT(now_ms() - start, 300u);
+}
+

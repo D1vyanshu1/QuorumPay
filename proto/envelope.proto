@@ -3,6 +3,7 @@ syntax = "proto3";
 package ledger.pb;
 
 import "peer.proto";
+import "raft.proto";
 import "client.proto";
 
 // Every frame on the wire carries exactly one Envelope, so a single parser
@@ -13,6 +14,7 @@ message Envelope {
     Hello hello = 1;
     Ping ping = 2;
     Pong pong = 3;
+    RaftMessage raft = 4;
 
     // client port: admin
     BlockPeer block_peer = 20;

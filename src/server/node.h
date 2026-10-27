@@ -15,13 +15,18 @@
 #include "net/fault_filter.h"
 #include "net/listener.h"
 #include "net/peer_manager.h"
+#include "raft/raft_core.h"
 
 namespace ledger {
 
-// One ledger node process. For now it only runs the network: it keeps the
-// peer mesh up, pings every peer each heartbeat to measure liveness and RTT,
-// and serves admin commands on its client port. In week 4 the Ping/Pong
-// traffic is replaced by RaftCore's messages.
+// One ledger node process. It hosts a RaftCore on top of the network layer:
+//
+//   timer tick ──▶ raft_.tick() ─┐
+//   Raft message ─▶ raft_.step() ─┴─▶ process_ready(): persist, then send
+//
+// Separately it pings every peer each heartbeat to measure reachability and
+// RTT for `status` (a network-health probe; Raft doesn't use it), and serves
+// admin commands on its client port.
 class Node {
  public:
   // A peer counts as unreachable if no Pong arrived within this window
@@ -39,6 +44,9 @@ class Node {
     uint64_t last_rtt_us = 0;
     bool reachable = false;
   };
+
+  raft::RaftConfig make_raft_config() const;
+  void process_ready();
 
   void on_tick();
   void send_pings();
@@ -61,6 +69,17 @@ class Node {
   uint64_t tick_count_ = 0;
   uint64_t ping_seq_ = 0;
   std::map<NodeId, PeerHealth> health_;
+
+  raft::RaftCore raft_;
+  // Stand-in for the disk until week 5 (MetaStore + WAL). Lost on restart, so
+  // a restarted node comes back at term 0 and simply catches up. Known gap:
+  // forgetting a vote can in theory allow a double vote in one term.
+  raft::HardState hard_state_;
+  std::vector<pb::LogEntry> log_;
+  // Last role/term/leader logged, so only changes are logged.
+  raft::Role logged_role_ = raft::Role::kFollower;
+  Term logged_term_ = 0;
+  NodeId logged_leader_ = kNoNode;
 };
 
 }  // namespace ledger
