@@ -5,3 +5,4 @@ results/
 *.key
 __pycache__/
 compile_commands.json
+context.md

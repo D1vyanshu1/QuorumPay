@@ -1,0 +1,6 @@
+syntax = "proto3";
+
+package ledger.pb;
+
+// Transaction, TxResult, Account (snapshot payload).
+// Skeleton: filled in Week 1.

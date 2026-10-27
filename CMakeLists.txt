@@ -39,6 +39,8 @@ find_package(Protobuf REQUIRED)
 set(LEDGER_PROTOS
   proto/peer.proto
   proto/client.proto
+  proto/raft.proto
+  proto/ledger.proto
   proto/envelope.proto)
 protobuf_generate_cpp(LEDGER_PROTO_SRCS LEDGER_PROTO_HDRS ${LEDGER_PROTOS})
 
@@ -67,11 +69,61 @@ target_link_libraries(ledger_net
   PUBLIC ledger_common ledger_proto
   PRIVATE ledger_warnings)
 
+# ---------------------------------------------------------------- crypto
+# Dependency rule: common <- crypto <- ledger;  common <- raft (raft never sees
+# net/ or storage/);  storage depends only on common/crypto.
+add_library(ledger_crypto STATIC
+  src/crypto/keys.cpp
+  src/crypto/signer.cpp
+  src/crypto/hash.cpp)
+target_link_libraries(ledger_crypto
+  PUBLIC ledger_common
+  PRIVATE ledger_warnings)
+
+# ---------------------------------------------------------------- ledger
+add_library(ledger_ledger STATIC
+  src/ledger/transaction.cpp
+  src/ledger/account_store.cpp
+  src/ledger/state_machine.cpp
+  src/ledger/state_hash.cpp)
+target_link_libraries(ledger_ledger
+  PUBLIC ledger_crypto ledger_proto
+  PRIVATE ledger_warnings)
+
+# ---------------------------------------------------------------- raft
+add_library(ledger_raft STATIC
+  src/raft/raft_core.cpp
+  src/raft/raft_log.cpp
+  src/raft/progress.cpp
+  src/raft/read_index.cpp)
+target_link_libraries(ledger_raft
+  PUBLIC ledger_common ledger_proto
+  PRIVATE ledger_warnings)
+
+# ---------------------------------------------------------------- storage
+add_library(ledger_storage STATIC
+  src/storage/meta_store.cpp
+  src/storage/wal.cpp
+  src/storage/snapshot_store.cpp
+  src/storage/file_util.cpp)
+target_link_libraries(ledger_storage
+  PUBLIC ledger_crypto ledger_proto
+  PRIVATE ledger_warnings)
+
 # ---------------------------------------------------------------- binaries
 add_executable(ledger-node
   src/server/main.cpp
-  src/server/node.cpp)
-target_link_libraries(ledger-node PRIVATE ledger_net ledger_warnings)
+  src/server/node.cpp
+  src/server/client_service.cpp
+  src/server/admin_service.cpp)
+target_link_libraries(ledger-node PRIVATE
+  ledger_net ledger_raft ledger_storage ledger_ledger ledger_warnings)
+
+add_executable(ledger-cli
+  src/client/main.cpp
+  src/client/client_lib.cpp
+  src/client/keystore.cpp)
+target_link_libraries(ledger-cli PRIVATE ledger_net ledger_ledger ledger_warnings)
 
 add_executable(ledger-admin src/client/admin_main.cpp)
 target_link_libraries(ledger-admin PRIVATE ledger_net ledger_warnings)
@@ -91,8 +143,20 @@ if(LEDGER_BUILD_TESTS)
     tests/unit/config_test.cpp
     tests/unit/fault_filter_test.cpp
     tests/unit/connection_test.cpp
-    tests/unit/peer_manager_test.cpp)
-  target_link_libraries(unit_tests PRIVATE ledger_net GTest::gtest_main ledger_warnings)
+    tests/unit/peer_manager_test.cpp
+    tests/unit/crypto_test.cpp
+    tests/unit/state_machine_test.cpp
+    tests/unit/wal_test.cpp)
+  target_link_libraries(unit_tests PRIVATE
+    ledger_net ledger_ledger ledger_storage GTest::gtest_main ledger_warnings)
   target_compile_definitions(unit_tests PRIVATE LEDGER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   gtest_discover_tests(unit_tests)
+
+  # Deterministic Raft simulation: links raft only, never net/ or storage/.
+  add_executable(raft_sim_tests
+    tests/sim/sim_network.cpp
+    tests/sim/raft_sim_test.cpp)
+  target_include_directories(raft_sim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  target_link_libraries(raft_sim_tests PRIVATE ledger_raft GTest::gtest_main ledger_warnings)
+  gtest_discover_tests(raft_sim_tests)
 endif()
