@@ -1,5 +1,7 @@
 #include "common/config.h"
 
+#include "common/hex.h"
+
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
@@ -29,6 +31,14 @@ uint32_t parse_u32(const nlohmann::json& j, const char* field, uint32_t def) {
   return static_cast<uint32_t>(v);
 }
 
+std::string read_file(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) fail("cannot open " + path);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
+}
+
 }  // namespace
 
 const NodeConfig* ClusterConfig::find(NodeId id) const {
@@ -38,13 +48,7 @@ const NodeConfig* ClusterConfig::find(NodeId id) const {
   return nullptr;
 }
 
-ClusterConfig ClusterConfig::load_file(const std::string& path) {
-  std::ifstream in(path);
-  if (!in) fail("cannot open " + path);
-  std::stringstream ss;
-  ss << in.rdbuf();
-  return parse(ss.str());
-}
+ClusterConfig ClusterConfig::load_file(const std::string& path) { return parse(read_file(path)); }
 
 ClusterConfig ClusterConfig::parse(const std::string& json_text) {
   nlohmann::json j;
@@ -112,6 +116,55 @@ void ClusterConfig::validate() const {
   if (raft.heartbeat_ticks >= raft.election_ticks_min) {
     fail("heartbeat_ticks must be < election_ticks_min");
   }
+}
+
+// ---------------------------------------------------------------- genesis
+
+uint64_t Genesis::total_supply() const {
+  uint64_t total = 0;
+  for (const auto& a : accounts) total += a.balance;  // parse() rules out overflow
+  return total;
+}
+
+Genesis Genesis::load_file(const std::string& path) { return parse(read_file(path)); }
+
+Genesis Genesis::parse(const std::string& json_text) {
+  nlohmann::json j;
+  try {
+    j = nlohmann::json::parse(json_text);
+  } catch (const nlohmann::json::parse_error& e) {
+    fail(std::string("genesis: invalid JSON: ") + e.what());
+  }
+
+  Genesis g;
+  std::set<std::string> names;
+  uint64_t total = 0;
+  try {
+    g.chain_id = j.at("chain_id").get<std::string>();
+    if (g.chain_id.empty()) fail("genesis: chain_id is empty");
+    for (const auto& a : j.at("accounts")) {
+      GenesisAccount ga;
+      ga.name = a.at("name").get<std::string>();
+      if (!names.insert(ga.name).second) fail("genesis: duplicate account " + ga.name);
+
+      auto key = from_hex(a.at("public_key_hex").get<std::string>());
+      if (!key || key->size() != 32) fail("genesis: " + ga.name + ": public_key_hex must be 64 hex chars");
+      ga.public_key = std::move(*key);
+
+      // Money is integer units; a float or negative number is a mistake.
+      const auto& bal = a.at("balance");
+      if (!bal.is_number_unsigned()) fail("genesis: " + ga.name + ": balance must be a non-negative integer");
+      ga.balance = bal.get<uint64_t>();
+      if (ga.balance > std::numeric_limits<uint64_t>::max() - total) {
+        fail("genesis: total supply overflows uint64");
+      }
+      total += ga.balance;
+      g.accounts.push_back(std::move(ga));
+    }
+  } catch (const nlohmann::json::exception& e) {
+    fail(std::string("genesis: ") + e.what());
+  }
+  return g;
 }
 
 }  // namespace ledger

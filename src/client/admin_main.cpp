@@ -153,7 +153,9 @@ int main(int argc, char** argv) {
                           {"last_log_index", s.last_log_index()},
                           {"commit_index", s.commit_index()},
                           {"applied_index", s.applied_index()},
-                          {"applied_hash", s.applied_hash()},
+                          {"state_hash", s.state_hash()},
+                          {"total_supply", s.total_supply()},
+                          {"accounts", s.accounts()},
                           {"peers", nlohmann::json::array()}};
     for (const auto& p : s.peers()) {
       out["peers"].push_back({{"id", p.id()},
@@ -171,7 +173,8 @@ int main(int argc, char** argv) {
     nlohmann::json out = {{"ok", r.ok()},
                           {"read_index", r.read_index()},
                           {"applied_index", r.applied_index()},
-                          {"applied_hash", r.applied_hash()},
+                          {"state_hash", r.state_hash()},
+                          {"total_supply", r.total_supply()},
                           {"leader_hint", r.leader_hint()},
                           {"error", r.error()}};
     std::cout << out.dump() << "\n";

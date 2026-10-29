@@ -22,11 +22,11 @@ from test_network import wait_for  # noqa: E402
 
 
 def applied(c, ids):
-    """{node: (applied_index, applied_hash)}"""
+    """{node: (applied_index, state_hash)}"""
     out = {}
     for n in ids:
         s = c.status(n)
-        out[n] = (s["applied_index"], s["applied_hash"])
+        out[n] = (s["applied_index"], s["state_hash"])
     return out
 
 

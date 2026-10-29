@@ -9,6 +9,7 @@
 
 #include "common/config.h"
 #include "common/types.h"
+#include "ledger/state_machine.h"
 #include "envelope.pb.h"
 #include "net/connection.h"
 #include "net/event_loop.h"
@@ -24,9 +25,9 @@ namespace ledger {
 //   timer tick ──▶ raft_.tick() ─┐
 //   Raft message ─▶ raft_.step() ─┴─▶ process_ready(): persist, send, apply
 //
-// Committed entries are "applied" by folding them into a running hash (the
-// ledger state machine replaces this in step 5), so `status` can show that
-// all nodes applied the same log.
+// Committed entries are applied to the ledger state machine, built from the
+// same genesis on every node; `status` shows its state hash so you can see
+// that all nodes hold identical balances.
 //
 // Separately it pings every peer each heartbeat to measure reachability and
 // RTT for `status` (a network-health probe; Raft doesn't use it), and serves
@@ -37,7 +38,7 @@ class Node {
   // (10 heartbeats at the default 50ms heartbeat).
   static constexpr uint64_t kUnreachableAfterMs = 500;
 
-  Node(ClusterConfig config, NodeId self);
+  Node(ClusterConfig config, NodeId self, const Genesis& genesis);
 
   // Blocks until SIGINT/SIGTERM.
   void run();
@@ -84,10 +85,9 @@ class Node {
   // forgetting a vote can in theory allow a double vote in one term.
   raft::HardState hard_state_;
   std::vector<pb::LogEntry> log_;
-  // The "state machine" for now. Volatile, like the log: rebuilt by
-  // re-applying from index 1 after a restart.
-  LogIndex applied_index_ = 0;
-  uint64_t applied_hash_ = 0;
+  // The replicated ledger. Volatile until week 5, like the log: after a
+  // restart it is rebuilt from genesis by re-applying committed entries.
+  ledger::StateMachine ledger_;
 
   // Reads waiting for Raft's confirmation: read id -> client connection id.
   // The connection is looked up again on completion; it may have gone away.

@@ -34,6 +34,10 @@ FetchContent_MakeAvailable(nlohmann_json)
 
 find_package(Protobuf REQUIRED)
 
+# libsodium ships a pkg-config file, not a CMake package.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
+
 # ---------------------------------------------------------------- proto
 # Generated headers land in the build dir as e.g. "envelope.pb.h".
 set(LEDGER_PROTOS
@@ -78,7 +82,7 @@ add_library(ledger_crypto STATIC
   src/crypto/hash.cpp)
 target_link_libraries(ledger_crypto
   PUBLIC ledger_common
-  PRIVATE ledger_warnings)
+  PRIVATE PkgConfig::SODIUM ledger_warnings)
 
 # ---------------------------------------------------------------- ledger
 add_library(ledger_ledger STATIC
@@ -147,17 +151,21 @@ if(LEDGER_BUILD_TESTS)
     tests/unit/crypto_test.cpp
     tests/unit/state_machine_test.cpp
     tests/unit/wal_test.cpp
-    tests/unit/raft_core_test.cpp)
+    tests/unit/raft_core_test.cpp
+    tests/unit/genesis_test.cpp
+    tests/unit/transaction_test.cpp)
   target_link_libraries(unit_tests PRIVATE
     ledger_net ledger_ledger ledger_storage ledger_raft GTest::gtest_main ledger_warnings)
   target_compile_definitions(unit_tests PRIVATE LEDGER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   gtest_discover_tests(unit_tests)
 
-  # Deterministic Raft simulation: links raft only, never net/ or storage/.
+  # Deterministic Raft simulation: Raft + the real ledger state machine, but
+  # never net/ or storage/ (no sockets, no files).
   add_executable(raft_sim_tests
     tests/sim/sim_network.cpp
     tests/sim/raft_sim_test.cpp)
   target_include_directories(raft_sim_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  target_link_libraries(raft_sim_tests PRIVATE ledger_raft GTest::gtest_main ledger_warnings)
+  target_link_libraries(raft_sim_tests PRIVATE
+    ledger_raft ledger_ledger GTest::gtest_main ledger_warnings)
   gtest_discover_tests(raft_sim_tests)
 endif()

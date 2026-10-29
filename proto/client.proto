@@ -32,9 +32,11 @@ message ReadResp {
   bool ok = 1;
   uint64 read_index = 2;     // commit index the read was taken at
   uint64 applied_index = 3;  // state the answer reflects (>= read_index)
-  uint64 applied_hash = 4;
+  reserved 4;                // was applied_hash (a placeholder before the ledger)
   uint32 leader_hint = 5;
   string error = 6;
+  string state_hash = 7;     // hex SHA-256 of the ledger state at applied_index
+  uint64 total_supply = 8;
 }
 
 message ProposeResp {
@@ -68,7 +70,12 @@ message StatusResp {
   uint64 last_log_index = 6;
   uint64 commit_index = 7;
   uint64 applied_index = 8;
-  // Running hash over every applied entry. Equal applied_index + equal hash
-  // on two nodes = they applied the same entries.
-  uint64 applied_hash = 9;
+  // Field numbers of removed fields are reserved, never reused: an old
+  // message must not be misread with a new meaning.
+  reserved 9;  // was applied_hash (a placeholder before the ledger)
+  // Hex SHA-256 of the ledger state. Equal applied_index + equal hash on two
+  // nodes = identical balances, keys and nonces.
+  string state_hash = 10;
+  uint64 total_supply = 11;  // sum of balances; never changes (conservation)
+  uint32 accounts = 12;
 }

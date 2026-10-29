@@ -12,23 +12,23 @@ The full design is in [`project_details.md`](project_details.md).
 Counted against the **49 "Build" items** in the plan (§8 of `project_details.md`):
 
 ```
-Overall   [█████████████░░░░░░░░░░░░░░░░░]  ~45%   (≈22 of 49 build items)
+Overall   [████████████████░░░░░░░░░░░░░░]  ~54%   (≈26 of 49 build items)
 ```
 
 ```mermaid
 pie showData
     title Plan build items
-    "Done" : 22
-    "Left" : 27
+    "Done" : 26
+    "Left" : 23
 ```
 
-> By *effort* it's closer to **38%**: the Raft core (Weeks 2–3, the hardest part) is done, but Weeks 5 and 6 haven't started.
+> By *effort* it's closer to **45%**: the Raft core and the ledger are done, but persistence (Week 5) and the fault-testing week (Week 6) haven't started.
 
 ### By plan week
 
 | Week | Topic | Progress | Status |
 |---|---|---|---|
-| 1 | Foundations: crypto, transactions, state machine | `██░░░░░░░░` 2 / 7 | 🟨 skeleton + framing only |
+| 1 | Foundations: crypto, transactions, state machine | `█████████░` 6.75 / 7 | ✅ crypto, transactions, state machine, keygen, genesis · client request messages (SubmitTx…) come in step 6 |
 | 2 | Raft: leader election + simulator | `██████████` 6 / 6 | ✅ done |
 | 3 | Raft: replication, commit, apply, ReadIndex | `█████████░` 6 / 7 | ✅ Raft core done · RETRY tracking moved to step 6 |
 | 4 | Network + node + CLI | `████████░░` 7 / 9 | 🟨 network + node (persist → send → apply) done; client service + CLI left |
@@ -48,8 +48,8 @@ flowchart BT
     S2["2. Leader election (simulator)<br/>agree on a leader"]:::done
     S3["3. Election on real cluster<br/>real processes pick a leader"]:::done
     S4["4. Log replication + commit + ReadIndex<br/>agree on a list of entries"]:::done
-    S5["5. Ledger: crypto + tx + state machine<br/>what entries mean"]:::next
-    S6["6. Client service + ledger-cli<br/>users send money"]:::todo
+    S5["5. Ledger: crypto + tx + state machine<br/>what entries mean"]:::done
+    S6["6. Client service + ledger-cli<br/>users send money"]:::next
     S7["7. Persistence: WAL + snapshots<br/>survive crashes"]:::todo
     S8["8. Pre-vote, checker, demos, chaos<br/>prove it's correct"]:::todo
     S9["9. Benchmarks + docs<br/>how fast is it"]:::todo
@@ -66,8 +66,8 @@ flowchart BT
 | 2. Election in simulator | Week 2 | ✅ |
 | 3. Election on real cluster | Week 4 (item 5, partly) | ✅ |
 | 4. Log replication + commit + ReadIndex | Week 3 | ✅ |
-| 5. Ledger (needs `libsodium-dev`) | Week 1 | 🔜 **next** |
-| 6. Client service + CLI | Week 4 (items 6, 8) | ⬜ |
+| 5. Ledger | Week 1 (+ Week 3 item 4) | ✅ |
+| 6. Client service + CLI | Week 4 (items 6, 8) + Week 3 item 5 (RETRY) | 🔜 **next** |
 | 7. Persistence | Week 5 | ⬜ |
 | 8. Correctness under faults | Week 6 | ⬜ |
 | 9. Benchmarks + docs | Week 7 | ⬜ |
@@ -82,34 +82,40 @@ flowchart LR
         common["common/<br/>config, logger, types"]
         net["net/<br/>event loop, framing,<br/>connections, peer mesh,<br/>fault filter"]
         raft["raft/<br/>RaftCore (election +<br/>replication + commit +<br/>ReadIndex), RaftLog,<br/>Progress, Ready"]
-        server["server/node<br/>hosts Raft + admin"]
+        server["server/node<br/>hosts Raft + ledger + admin"]
         admin["client/admin_main<br/>ledger-admin"]
+        crypto["crypto/<br/>Ed25519, SHA-256, CRC32,<br/>key files"]
+        ledger["ledger/<br/>transactions, accounts,<br/>state machine, state hash"]
+    end
+    subgraph partial["Partly built"]
+        cli["client/ ledger-cli<br/>keygen ✅ · cluster commands ⬜"]
     end
     subgraph stubs["Stubs only (empty files)"]
-        crypto["crypto/"]
-        ledger["ledger/"]
         storage["storage/"]
-        cli["client/ ledger-cli"]
         svc["server/client_service"]
     end
     common --> net --> server
     common --> raft --> server
-    common -.-> crypto -.-> ledger
+    common --> crypto --> ledger --> server
     crypto -.-> storage
 
     style built fill:#e8f5e9,stroke:#2e7d32
+    style partial fill:#fff8e1,stroke:#f9a825
     style stubs fill:#f5f5f5,stroke:#9e9e9e,stroke-dasharray: 5 5
 ```
 
 | Module | Files | State |
 |---|---|---|
-| `common/` | `types.h`, `config`, `logger`, `clock.h` | ✅ (`status.h` is a stub) |
+| `common/` | `types.h`, `config` (+ genesis), `logger`, `clock.h`, `status.h`, `hex.h` | ✅ |
 | `net/` | `event_loop`, `framing`, `connection`, `listener`, `peer_manager`, `fault_filter` | ✅ |
 | `raft/` | `raft_core`, `raft_log`, `progress.h`, `read_index`, `ready.h` | ✅ election + replication + commit + ReadIndex |
-| `server/` | `node`, `main` | ✅ runs Raft, applies entries (running hash), `propose` test command · `client_service`, `admin_service` are stubs |
-| `client/` | `admin_main` (`ledger-admin`) | ✅ · `client_lib`, `keystore`, `ledger-cli` are stubs |
-| `crypto/`, `ledger/`, `storage/` | — | ⬜ stubs |
-| `proto/` | `peer`, `client`, `envelope`, `raft` | ✅ · `ledger.proto` is empty |
+| `server/` | `node`, `main` | ✅ runs Raft, loads genesis, applies entries to the ledger, `propose`/`read` test commands · `client_service`, `admin_service` are stubs |
+| `client/` | `admin_main` (`ledger-admin`), `keystore`, `main` (`ledger-cli keygen`/`pubkey`) | ✅ · `client_lib` and the cluster commands come in step 6 |
+| `crypto/` | `hash` (CRC32, SHA-256), `keys` (Ed25519 pairs, key files 0600), `signer` (sign/verify) | ✅ libsodium |
+| `ledger/` | `transaction`, `encoding.h`, `account_store`, `state_machine`, `state_hash` | ✅ 7-step validation, nonces, tx_index, history, SHA-256 state hash |
+| `storage/` | — | ⬜ stubs |
+| `proto/` | `peer`, `client`, `envelope`, `raft`, `ledger` | ✅ (client SubmitTx/GetBalance messages come in step 6) |
+| `tools/` | `cluster.py`, `make_genesis.py` | ✅ · faults/workload/checker/chaos/bench/plot/demos are stubs |
 
 ---
 
@@ -169,13 +175,13 @@ files. The node feeds it inputs and carries out its outputs.
 │      │                                     ├─ ping ──▶ reply Pong    │  (memory) │
 │      │                                     └─ pong ──▶ RTT/health    │  2. send  │
 │      │                                                               │  3. apply │
-│      │                                                               └──▶ (hash) │
+│      │                                                               └─▶ (ledger)│
 │      └── client socket ─▶ admin: status / block / propose / read ─▶ propose()   │
 │                                         (reads wait in pending_reads_) read_index()│
 │                                                                                 │
 │   RaftCore (pure: no I/O)          In-memory "disk" (until step 7)              │
 │   role, term, votedFor, log,       hard_state_ {term, votedFor}, log_           │
-│   commitIndex, Progress per peer   "state machine": applied_index_ + hash        │
+│   commitIndex, Progress per peer   ledger_: StateMachine (from genesis.json)     │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -189,7 +195,7 @@ flowchart LR
     C["RaftCore<br/>(pure logic)"] --> R["Ready<br/>• hard_state (term, vote)<br/>• new log entries<br/>• messages<br/>• committed entries<br/>• reads ready / failed"]
     R --> P["1. Persist<br/>(memory now, fsync in step 7)"]
     P --> S["2. Send<br/>(PeerManager)"]
-    S --> A["3. Apply<br/>(hash now, ledger in step 5)"]
+    S --> A["3. Apply<br/>(ledger state machine)"]
     A --> RD["4. Answer reads<br/>(state is now ≥ readIndex)"]
 ```
 
@@ -320,7 +326,43 @@ sequenceDiagram
 
 A cut-off leader never gets the majority, so its reads hang. When it later sees a higher term it steps down and fails them, and the client retries on the new leader.
 
-### 4.9 What happens on failures (verified by tests)
+### 4.9 The ledger (what the log entries mean)
+
+Each Raft log entry carries one **signed transaction**. Every node applies the committed entries in order to the same
+**deterministic state machine**, built from the same `genesis.json`, so all nodes end up with identical balances.
+
+```mermaid
+flowchart LR
+    W["ledger-cli<br/>(holds the secret key)"] -- "sign(signing_bytes)" --> T["Transaction<br/>type · chain_id · sender ·<br/>receiver · amount · nonce ·<br/>signature"]
+    T -- "proposed as a<br/>log entry" --> R["Raft log<br/>(committed, ordered)"]
+    R --> SM["StateMachine.apply()<br/>on every node"]
+    SM --> H["SHA-256 state hash<br/>(same on all nodes)"]
+```
+
+**What gets signed:** a fixed byte layout, not protobuf bytes (protobuf isn't guaranteed to be byte-identical everywhere):
+`"LEDGER_TX_V1" | chain_id | type | sender | receiver | amount | nonce | [public key]`, with length prefixes.
+The domain tag, `chain_id` and `nonce` together stop a signature being reused elsewhere, on another ledger, or twice.
+
+**Validation pipeline** (the first failing check decides the result):
+
+```
+ 1. well-formed?  ──no──▶ MALFORMED            ┐
+ 2. sender exists? ─no──▶ UNKNOWN_ACCOUNT      │ nothing changes:
+ 3. signature ok?  ─no──▶ BAD_SIGNATURE        │ junk can't burn someone else's nonce
+ 4. nonce = next?  ─no──▶ BAD_NONCE            ┘ (this is what stops double spends + replays)
+    ── sender proven: nonce is used up from here ──
+ 5. receiver exists? no─▶ UNKNOWN_RECEIVER     ┐ nonce consumed, no money moves:
+ 6. enough funds?  ─no──▶ INSUFFICIENT_FUNDS   ┘ this signed transfer can never be replayed
+ 7. move the money ─────▶ OK
+```
+
+**Exactly-once:** a client that retries the same signed bytes gets `BAD_NONCE` if the original already committed, and
+the original `OK` stays on record under its `tx_id` (= SHA-256 of signing bytes + signature). A transfer can't apply twice.
+
+**Determinism:** accounts are kept in a `std::map` (sorted), with no clock, randomness or unordered iteration, so the same
+entries always produce the same state hash. Total supply never changes (only genesis creates money).
+
+### 4.10 What happens on failures (verified by tests)
 
 ```mermaid
 flowchart LR
@@ -343,14 +385,15 @@ flowchart LR
 | Suite | Count | What it proves |
 |---|---|---|
 | `unit_tests` (network) | 26 | framing, connections, peer mesh, reconnect, fault filter, config |
+| `unit_tests` (crypto + ledger) | 38 | CRC32; SHA-256 FIPS vectors; **Ed25519 RFC 8032 vector**, tamper/wrong-key rejection; key files (0600, no overwrite); genesis; signing bytes pinned byte-for-byte; **one test per validation-table row**, double spend, replay keeps original result, determinism, conservation |
 | `unit_tests` (`RaftCore`) | 32 | votes, step-down, no-op, heartbeats; append/reject/truncate, conflict hints, backtracking, majority commit, **Figure 8**, follower commit bound; ReadIndex: majority ack, stale-reply ctx, new-leader wait, fail on step-down |
-| `raft_sim_tests` | 13 | election (1000 seeds), crash, partition, loss/dup/reorder, split votes; **replication + commit**, crashed follower catches up, divergent log repaired, **all 5 safety properties under random crashes + partitions + proposals** (300 seeds); **stale leader never serves reads**; reads linearizable under random faults |
+| `raft_sim_tests` | 15 | election (1000 seeds), crash, partition, loss/dup/reorder, split votes; **replication + commit**, crashed follower catches up, divergent log repaired, **all 5 safety properties under random crashes + partitions + proposals** (300 seeds); **stale leader never serves reads**; reads linearizable under random faults; **ledger on Raft: double spend under failover applies exactly once** (200 seeds); ledger consistent under random faults with real signed transfers (100 seeds) |
 | `test_network.py` | 1 script | 5 real processes: mesh, kill/restart, partition/heal |
 | `test_election.py` | 1 script | 5 real processes: election, failover, restart without disruption, partition, heal |
-| `test_replication.py` | 1 script | 5 real processes: entries applied everywhere (same hash), follower catch-up, minority leader can't commit or answer reads, heal overwrites its entries |
+| `test_replication.py` | 1 script | 5 real processes: entries applied everywhere (same ledger state hash), follower catch-up, minority leader can't commit or answer reads, heal overwrites its entries |
 
 ```sh
-cmake --build build -j && ctest --test-dir build      # 71 unit + sim tests (also pass under ASan/UBSan)
+cmake --build build -j && ctest --test-dir build      # 111 unit + sim tests (also pass under ASan/UBSan)
 python3 tests/integration/test_network.py
 python3 tests/integration/test_election.py
 python3 tests/integration/test_replication.py
@@ -366,6 +409,8 @@ python3 tests/integration/test_replication.py
 | Leader Completeness | a new leader has every committed entry |
 | State Machine Safety | no two nodes apply different entries at one index |
 | Read Linearizability | a served read reflects every write committed before it started |
+| Deterministic apply | every node has the same ledger state hash after applying the same index |
+| No double spend (in tests) | no (sender, nonce) is applied successfully twice; total supply never changes |
 
 **Proof that the checks work (mutation testing):** each bug below was planted on purpose. The test that caught it is listed.
 
@@ -380,6 +425,11 @@ python3 tests/integration/test_replication.py
 | Serve reads without a confirmation round | sim: Read Linearizability + unit tests |
 | Don't wait for the new leader's no-op to commit | sim: Read Linearizability + unit test |
 | Count replies to messages sent before the read | unit: `ReplyToMessageSentBeforeReadDoesNotConfirmIt` (random sim missed it) |
+| Ledger: no nonce check | unit: double spend / replay / row 4 tests · sim: "alice nonce 0 used twice" |
+| Ledger: consume nonce before the signature check | unit: `Row3BadSignatureConsumesNoNonce` |
+| Ledger: failed transfer doesn't consume its nonce | unit: rows 5–6, consecutive-spend, replay tests |
+| Ledger: a retry overwrites the original OK | unit: `ReplayFailsAndKeepsOriginalResult` |
+| Ledger: no chain_id check | unit: `Row1Malformed` |
 
 **Bugs found so far:**
 
@@ -396,25 +446,21 @@ python3 tests/integration/test_replication.py
 
 ```mermaid
 flowchart TB
-    subgraph S5["Step 5: Ledger (next)"]
+    subgraph S6["Step 6: Clients (next)"]
         direction LR
-        l1["Ed25519 keys + signatures"] --> l2["transactions + nonces"] --> l3["7-step validation"] --> l4["state hash"]
-    end
-    subgraph S6["Step 6: Clients"]
-        direction LR
-        c1["client_service"] --> c2["ledger-cli<br/>(redirect + retry)"]
+        c1["client_service<br/>SubmitTx, GetBalance,<br/>GetHistory, GetTx"] --> c2["proposal tracking<br/>+ RETRY"] --> c3["ledger-cli<br/>create_account, fund,<br/>transfer, balance<br/>(redirect + retry)"]
     end
     subgraph S7["Step 7: Persistence"]
         direction LR
         p1["meta file<br/>(term, vote)"] --> p2["WAL + CRC"] --> p3["snapshots +<br/>InstallSnapshot"]
     end
-    S5 --> S6 --> S7 --> S8["Step 8: pre-vote, checker,<br/>3 demos, chaos"] --> S9["Step 9: benchmarks + docs"]
+    S6 --> S7 --> S8["Step 8: pre-vote, checker,<br/>3 demos, chaos"] --> S9["Step 9: benchmarks + docs"]
 ```
 
 **Known gaps in the current code:**
 - Storage is in memory, so a restarted node forgets its vote and its log (fixed in step 7).
-- Proposals aren't tracked yet: the `propose` command answers "accepted", not "committed". Tracking + RETRY come with the client service (step 6).
-- Each `apply` only updates a hash; the real ledger state machine comes in step 5.
+- Proposals aren't tracked yet: the `propose` test command answers "accepted", not "committed". Tracking + RETRY come with the client service (step 6).
+- There's no way yet to send a signed transfer to the live cluster (the `ledger-cli` cluster commands are step 6), and the repo's `config/genesis.json` has no accounts until `make_genesis.py` is run.
+- `OVERFLOW` (validation step 6) can't actually happen, because genesis ensures total supply fits in uint64; it's checked anyway.
 - No pre-vote yet: a node that can't hear the leader can still disrupt it with a higher term (fixed in step 8).
 - An old leader cut off in a minority doesn't step down by itself (harmless; check-quorum could fix it).
-- `libsodium-dev` isn't installed yet (needed in step 5).

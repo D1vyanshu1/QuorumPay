@@ -10,17 +10,19 @@
 #include <utility>
 
 #include "common/clock.h"
+#include "common/hex.h"
 #include "common/logger.h"
 
 namespace ledger {
 
-Node::Node(ClusterConfig config, NodeId self)
+Node::Node(ClusterConfig config, NodeId self, const Genesis& genesis)
     : config_(std::move(config)),
       self_(self),
       peers_(loop_, config_, self_, faults_),
       // Nothing on disk yet (week 5 loads HardState + log here). Note raft_ is
       // declared before hard_state_/log_, so it must not read them here.
-      raft_(make_raft_config(), raft::HardState{}, {}) {
+      raft_(make_raft_config(), raft::HardState{}, {}),
+      ledger_(genesis) {
   if (config_.find(self_) == nullptr) {
     throw std::runtime_error("node id " + std::to_string(self_) + " not in cluster config");
   }
@@ -118,7 +120,7 @@ void Node::process_ready() {
 
   for (const auto& e : rd.committed_entries) apply(e);
 
-  // Reads go last: the entries above bring applied_index_ up to (at least)
+  // Reads go last: the entries above bring the ledger up to (at least)
   // each read's index.
   for (const auto& rs : rd.reads_ready) finish_read(rs.request_id, &rs);
   for (uint64_t id : rd.reads_failed) finish_read(id, nullptr);
@@ -136,19 +138,12 @@ void Node::process_ready() {
 }
 
 void Node::apply(const pb::LogEntry& e) {
-  // FNV-1a over (index, term, data), chained from the previous hash. Cheap
-  // and deterministic; a stand-in for the ledger's SHA-256 state hash.
-  auto mix = [this](const void* p, size_t n) {
-    const auto* b = static_cast<const unsigned char*>(p);
-    for (size_t i = 0; i < n; ++i) applied_hash_ = (applied_hash_ ^ b[i]) * 1099511628211ULL;
-  };
-  if (applied_hash_ == 0) applied_hash_ = 14695981039346656037ULL;
-  uint64_t index = e.index(), term = e.term();
-  mix(&index, sizeof index);
-  mix(&term, sizeof term);
-  mix(e.data().data(), e.data().size());
-  applied_index_ = e.index();
-  log_debug("apply", {{"index", index}, {"term", term}, {"bytes", e.data().size()}});
+  auto r = ledger_.apply(e);
+  if (r) {
+    log_debug("apply", {{"index", e.index()},
+                        {"tx_id", to_hex(r->tx_id)},
+                        {"status", tx_status_name(r->status)}});
+  }
 }
 
 void Node::start_read(net::Connection& conn) {
@@ -176,8 +171,9 @@ void Node::finish_read(uint64_t read_id, const raft::ReadState* ok) {
   if (ok) {
     r->set_ok(true);
     r->set_read_index(ok->index);
-    r->set_applied_index(applied_index_);
-    r->set_applied_hash(applied_hash_);
+    r->set_applied_index(ledger_.last_applied());
+    r->set_state_hash(to_hex(ledger_.state_hash()));
+    r->set_total_supply(ledger_.total_supply());
   } else {
     r->set_error("leadership lost, retry");
     r->set_leader_hint(raft_.leader());
@@ -317,8 +313,10 @@ pb::StatusResp Node::build_status() const {
   s.set_leader(raft_.leader());
   s.set_last_log_index(raft_.log().last_index());
   s.set_commit_index(raft_.commit_index());
-  s.set_applied_index(applied_index_);
-  s.set_applied_hash(applied_hash_);
+  s.set_applied_index(ledger_.last_applied());
+  s.set_state_hash(to_hex(ledger_.state_hash()));
+  s.set_total_supply(ledger_.total_supply());
+  s.set_accounts(static_cast<uint32_t>(ledger_.accounts().all().size()));
   uint64_t now = now_ms();
   for (const auto& [id, h] : health_) {
     pb::PeerStatus* p = s.add_peers();

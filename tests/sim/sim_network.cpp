@@ -7,6 +7,7 @@ SimCluster::SimCluster(int nodes, uint64_t seed, SimOptions opts)
   for (NodeId id = 1; id <= static_cast<NodeId>(nodes); ++id) {
     disks_[id] = Disk{};
     applied_index_[id] = 0;
+    state_[id] = std::make_unique<ledger::StateMachine>(opts_.genesis);
   }
   for (NodeId id = 1; id <= static_cast<NodeId>(nodes); ++id) nodes_[id] = make_core(id);
 }
@@ -148,6 +149,15 @@ void SimCluster::process_ready(NodeId id) {
                 std::to_string(it->second.term()) + " elsewhere but term " +
                 std::to_string(e.term()) + " on node " + std::to_string(id));
     }
+
+    // The real ledger. Same entries must give the same state everywhere.
+    ledger::StateMachine& sm = *state_.at(id);
+    sm.apply(e);
+    auto [h, first] = state_hash_at_.emplace(e.index(), sm.state_hash());
+    if (!first && h->second != sm.state_hash()) {
+      violation("Deterministic apply: node " + std::to_string(id) + " has a different state hash at index " +
+                std::to_string(e.index()));
+    }
   }
 
   // 4. Serve reads from the state machine as it is now.
@@ -184,6 +194,7 @@ void SimCluster::crash(NodeId id) {
     if (o.node == id && !o.done) o.failed = true;  // its client sees the connection drop
   }
   applied_index_.at(id) = 0;  // the state machine lives in memory
+  state_.at(id) = std::make_unique<ledger::StateMachine>(opts_.genesis);
 }
 
 void SimCluster::restart(NodeId id) {

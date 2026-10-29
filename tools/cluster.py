@@ -173,7 +173,7 @@ def print_status(cluster):
         leader = s["leader"] or "?"
         raft = (f"{s['role']:<9} term {s['term']:<3} leader {leader}  "
                 f"log {s['last_log_index']:<4} commit {s['commit_index']:<4} "
-                f"applied {s['applied_index']:<4} hash {s['applied_hash'] % 10**6:06d}")
+                f"applied {s['applied_index']:<4} hash {s['state_hash'][:8]}")
         print(f"node {nid}: {raft} | peers " + "  ".join(parts))
 
 

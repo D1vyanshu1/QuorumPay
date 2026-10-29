@@ -44,4 +44,28 @@ struct ClusterConfig {
   void validate() const;
 };
 
+struct GenesisAccount {
+  std::string name;
+  std::string public_key;  // 32 raw bytes (hex in the JSON file)
+  uint64_t balance = 0;
+};
+
+// Loaded from config/genesis.json: the ledger state before log index 1.
+// Every node loads the identical file, so every node starts from the same
+// state. Money only enters the system here (usually one "faucet" account);
+// afterwards transfers just move it, so total supply never changes.
+//
+// This checks the file's shape. The ledger state machine applies its own
+// rules (e.g. account-name format) when it builds the initial state.
+struct Genesis {
+  std::string chain_id;
+  std::vector<GenesisAccount> accounts;
+
+  uint64_t total_supply() const;
+
+  // Both throw std::runtime_error with a readable message on any problem.
+  static Genesis load_file(const std::string& path);
+  static Genesis parse(const std::string& json_text);
+};
+
 }  // namespace ledger

@@ -2,5 +2,39 @@ syntax = "proto3";
 
 package ledger.pb;
 
-// Transaction, TxResult, Account (snapshot payload).
-// Skeleton: filled in Week 1.
+// Ledger data: transactions (the payload of Raft log entries), their results,
+// and accounts (the snapshot payload in week 5).
+//
+// Signatures do NOT cover these protobuf bytes: protobuf encoding isn't
+// guaranteed to be byte-for-byte identical across versions or languages. A
+// fixed hand-written encoding is signed instead (Transaction::signing_bytes).
+
+enum TxType {
+  TX_UNSPECIFIED = 0;     // never valid: rejected as MALFORMED
+  TX_CREATE_ACCOUNT = 1;  // signed by the new account's own key
+  TX_TRANSFER = 2;
+}
+
+message Transaction {
+  TxType type = 1;
+  string chain_id = 2;   // which ledger this is for: stops cross-ledger replays
+  string sender = 3;     // CREATE_ACCOUNT: the new account's name
+  string receiver = 4;   // TRANSFER only
+  uint64 amount = 5;     // TRANSFER only, > 0
+  uint64 nonce = 6;      // sender's next expected nonce (CREATE_ACCOUNT: 0)
+  bytes public_key = 7;  // CREATE_ACCOUNT only, 32 bytes
+  bytes signature = 8;   // Ed25519, 64 bytes, over the canonical signing bytes
+}
+
+message TxResult {
+  bytes tx_id = 1;    // SHA-256(signing bytes || signature)
+  uint64 index = 2;   // log index it was applied at
+  uint32 status = 3;  // ledger::TxStatus
+}
+
+message Account {
+  string name = 1;
+  bytes public_key = 2;
+  uint64 balance = 3;
+  uint64 next_nonce = 4;
+}

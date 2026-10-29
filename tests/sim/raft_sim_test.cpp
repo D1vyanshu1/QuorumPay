@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <set>
 
 #include "sim/sim_network.h"
 
@@ -428,4 +429,186 @@ TEST(RaftSim, ReadsAreLinearizableUnderRandomFaults) {
   }
   EXPECT_GT(served, 1000u);  // most reads still get served
   std::cout << "reads served " << served << ", failed (leader lost) " << failed << "\n";
+}
+
+// ---------------------------------------------------------------- the ledger on Raft
+
+namespace {
+
+namespace lg = ledger::ledger;
+using ledger::TxStatus;
+using ledger::crypto::KeyPair;
+
+KeyPair sim_key(char c) { return ledger::crypto::keypair_from_seed(std::string(32, c)); }
+
+SimOptions ledger_opts() {
+  SimOptions o;
+  o.genesis.chain_id = "sim-chain";
+  o.genesis.accounts = {{"alice", sim_key('a').public_key, 100},
+                        {"bob", sim_key('b').public_key, 0},
+                        {"carol", sim_key('c').public_key, 0}};
+  return o;
+}
+
+std::string signed_transfer(const std::string& from, const std::string& to, uint64_t amount,
+                            uint64_t nonce, char key) {
+  lg::Transaction t;
+  t.type = lg::TxType::kTransfer;
+  t.chain_id = "sim-chain";
+  t.sender = from;
+  t.receiver = to;
+  t.amount = amount;
+  t.nonce = nonce;
+  t.sign(sim_key(key));
+  return t.to_proto().SerializeAsString();
+}
+
+void expect_same_ledger_everywhere(SimCluster& c, uint64_t seed) {
+  std::string hash;
+  for (NodeId id : c.ids()) {
+    if (!c.is_up(id)) continue;
+    if (hash.empty()) hash = c.state(id).state_hash();
+    EXPECT_EQ(c.state(id).state_hash(), hash) << "node " << id << ", seed " << seed;
+  }
+}
+
+}  // namespace
+
+// The plan's "done when" for Week 3: the same nonce proposed twice under
+// failover yields exactly one apply. Alice (100) signs two conflicting
+// transfers of 80 with nonce 0. The first goes to a leader that gets cut off
+// and deposed; the client then retries it and also sends the other one to
+// the new leader, in a random order.
+TEST(RaftSim, DoubleSpendUnderFailoverAppliesExactlyOnce) {
+  const std::string to_bob = signed_transfer("alice", "bob", 80, 0, 'a');
+  const std::string to_carol = signed_transfer("alice", "carol", 80, 0, 'a');
+  for (uint64_t seed = 1; seed <= 200; ++seed) {
+    SimCluster c(5, seed, ledger_opts());
+    ASSERT_NE(c.run_until_leader(300), -1);
+    NodeId old = c.leaders()[0];
+    std::vector<NodeId> rest;
+    for (NodeId id : c.ids())
+      if (id != old) rest.push_back(id);
+
+    // Seeds alternate between "old leader is cut off" and "old leader crashes".
+    if (seed % 2) {
+      c.partition({{old}, rest});
+    }
+    c.propose_on(old, to_bob);
+    if (seed % 2 == 0) c.crash(old);
+
+    NodeId fresh = kNoNode;
+    for (int i = 0; i < 500 && fresh == kNoNode; ++i) {
+      c.tick();
+      fresh = c.stable_leader(rest);
+    }
+    ASSERT_NE(fresh, kNoNode) << "seed " << seed;
+    std::mt19937 order(static_cast<uint32_t>(seed));
+    std::vector<std::string> sends = {to_bob, to_carol, to_bob};  // includes a retry
+    std::shuffle(sends.begin(), sends.end(), order);
+    for (const auto& s : sends) c.propose_on(fresh, s);
+
+    c.heal();
+    if (!c.is_up(old)) c.restart(old);
+    ASSERT_NE(c.run_until_converged(1000), -1) << "seed " << seed;
+
+    const auto& sm = c.state(fresh);
+    uint64_t bob = sm.account("bob")->balance, carol = sm.account("carol")->balance;
+    EXPECT_EQ(sm.account("alice")->balance, 20u) << "seed " << seed;
+    EXPECT_EQ(bob + carol, 80u) << "money spent twice or not at all, seed " << seed;
+    EXPECT_EQ(sm.account("alice")->next_nonce, 1u);
+    EXPECT_EQ(sm.total_supply(), 100u);
+    expect_same_ledger_everywhere(c, seed);
+    expect_safe(c);
+  }
+}
+
+// Clients send real signed transfers (including conflicting ones with the
+// same nonce, and retries of the same bytes) while nodes crash and the
+// network splits. At the end: one ledger state everywhere, no money created
+// or destroyed, and no (sender, nonce) applied twice.
+TEST(RaftSim, LedgerStaysConsistentUnderRandomFaults) {
+  const std::vector<std::string> names = {"alice", "bob", "carol"};
+  const std::vector<char> keys = {'a', 'b', 'c'};
+  SimOptions opts = ledger_opts();
+  opts.genesis.accounts[1].balance = 100;
+  opts.genesis.accounts[2].balance = 100;
+  opts.drop_rate = 0.10;
+  opts.duplicate_rate = 0.05;
+  size_t ok_total = 0;
+  for (uint64_t seed = 1; seed <= 100; ++seed) {
+    SimCluster c(5, seed, opts);
+    std::mt19937_64 rng(seed * 31 + 7);
+    std::vector<std::string> sent;
+    for (int round = 0; round < 50; ++round) {
+      c.run(static_cast<int>(rng() % 25));
+      for (int k = static_cast<int>(rng() % 3); k > 0; --k) {
+        size_t from = rng() % 3, to = (from + 1 + rng() % 2) % 3;
+        std::string tx;
+        if (!sent.empty() && rng() % 4 == 0) {
+          tx = sent[rng() % sent.size()];  // retry of earlier signed bytes
+        } else {
+          // Like the real client: read the sender's next nonce from the
+          // current leader's state first. Sometimes use an older one, which
+          // makes a conflicting spend of an already-used nonce.
+          uint64_t n = 0;
+          if (!c.leaders().empty()) n = c.state(c.leaders()[0]).account(names[from])->next_nonce;
+          if (n > 0 && rng() % 5 == 0) --n;
+          tx = signed_transfer(names[from], names[to], 1 + rng() % 60, n, keys[from]);
+          sent.push_back(tx);
+        }
+        c.propose(tx);
+      }
+      switch (rng() % 6) {
+        case 0: {
+          NodeId id = static_cast<NodeId>(rng() % 5 + 1);
+          if (c.is_up(id)) {
+            c.crash(id);
+          } else {
+            c.restart(id);
+          }
+          break;
+        }
+        case 1: {
+          std::vector<NodeId> ids = c.ids();
+          std::shuffle(ids.begin(), ids.end(), rng);
+          c.partition({{ids[0], ids[1]}, {ids[2], ids[3], ids[4]}});
+          break;
+        }
+        case 2:
+          c.heal();
+          break;
+        default:
+          break;
+      }
+    }
+    c.heal();
+    for (NodeId id : c.ids())
+      if (!c.is_up(id)) c.restart(id);
+    ASSERT_NE(c.run_until_converged(3000), -1) << "seed " << seed;
+    expect_same_ledger_everywhere(c, seed);
+
+    // Conservation, and no (sender, nonce) applied twice.
+    NodeId any = c.stable_leader(c.ids());
+    const auto& sm = c.state(any);
+    EXPECT_EQ(sm.total_supply(), 300u) << "seed " << seed;
+    std::set<std::pair<std::string, uint64_t>> spent;
+    for (const auto& [index, e] : c.applied_history()) {
+      if (e.type() != ledger::pb::ENTRY_NORMAL) continue;
+      ledger::pb::Transaction p;
+      ASSERT_TRUE(p.ParseFromString(e.data()));
+      lg::Transaction t = lg::Transaction::from_proto(p);
+      auto rec = sm.tx(t.tx_id());
+      ASSERT_TRUE(rec.has_value());
+      if (rec->index == index && ledger::consumes_nonce(rec->status)) {
+        EXPECT_TRUE(spent.insert({t.sender, t.nonce}).second)
+            << t.sender << " nonce " << t.nonce << " used twice, seed " << seed;
+        ok_total += rec->status == TxStatus::kOk;
+      }
+    }
+    expect_safe(c);
+    if (!c.violations().empty()) break;
+  }
+  EXPECT_GT(ok_total, 500u);  // plenty of transfers really happened
+  std::cout << "successful transfers across all seeds: " << ok_total << "\n";
 }

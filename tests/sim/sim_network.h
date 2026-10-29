@@ -10,6 +10,8 @@
 #include <tuple>
 #include <vector>
 
+#include "common/config.h"
+#include "ledger/state_machine.h"
 #include "raft/raft_core.h"
 
 namespace ledger::sim {
@@ -25,6 +27,11 @@ struct SimOptions {
   // Election timeout range handed to every RaftCore.
   int election_timeout_min = 15;
   int election_timeout_max = 30;
+
+  // Initial ledger state for every node's state machine. Entries that aren't
+  // signed transactions (e.g. "tx-1" strings in Raft-only tests) are simply
+  // MALFORMED there, which still exercises deterministic apply.
+  Genesis genesis{"sim-chain", {}};
 };
 
 // A whole Raft cluster in one process, driven by a virtual clock.
@@ -47,6 +54,8 @@ struct SimOptions {
 //   State Machine Safety no two nodes apply different entries at one index
 //   Read Linearizability a served read reflects every write committed
 //                        anywhere before the read started
+//   Deterministic apply  every node has the same ledger state hash after
+//                        applying the same index
 class SimCluster {
  public:
   SimCluster(int nodes, uint64_t seed, SimOptions opts = {});
@@ -103,6 +112,8 @@ class SimCluster {
   // Every entry any node has applied, by index (the "agreed history").
   const std::map<LogIndex, pb::LogEntry>& applied_history() const { return applied_history_; }
   LogIndex applied_index(NodeId id) const { return applied_index_.at(id); }
+  // The node's ledger (volatile: rebuilt from genesis after a restart).
+  const ledger::StateMachine& state(NodeId id) const { return *state_.at(id); }
   // The node's persisted log (survives crashes).
   const std::vector<pb::LogEntry>& disk_log(NodeId id) const { return disks_.at(id).log; }
 
@@ -135,6 +146,8 @@ class SimCluster {
   std::map<std::tuple<uint64_t, uint64_t>, pb::RaftMessage> queue_;
 
   std::map<NodeId, LogIndex> applied_index_;  // volatile: reset by crash()
+  std::map<NodeId, std::unique_ptr<ledger::StateMachine>> state_;  // volatile too
+  std::map<LogIndex, std::string> state_hash_at_;  // first hash seen per index
   std::map<LogIndex, pb::LogEntry> applied_history_;
   std::map<uint64_t, ReadOutcome> reads_;
 

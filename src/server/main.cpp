@@ -1,6 +1,7 @@
 // ledger-node: one node of the cluster.
 //
-//   ledger-node --config config/cluster.json --id 3 [--log-level debug]
+//   ledger-node --config config/cluster.json --id 3 [--genesis config/genesis.json]
+//               [--log-level debug]
 
 #include <cstdlib>
 #include <exception>
@@ -15,13 +16,14 @@ namespace {
 
 void usage() {
   std::cerr << "usage: ledger-node --config <cluster.json> --id <node-id> "
-               "[--log-level debug|info|warn|error]\n";
+               "[--genesis <genesis.json>] [--log-level debug|info|warn|error]\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string config_path = "config/cluster.json";
+  std::string genesis_path = "config/genesis.json";
   long id = 0;
   std::string level = "info";
 
@@ -32,6 +34,7 @@ int main(int argc, char** argv) {
       return 2;
     }
     if (arg == "--config") config_path = argv[++i];
+    else if (arg == "--genesis") genesis_path = argv[++i];
     else if (arg == "--id") id = std::strtol(argv[++i], nullptr, 10);
     else if (arg == "--log-level") level = argv[++i];
     else {
@@ -50,7 +53,8 @@ int main(int argc, char** argv) {
 
   try {
     auto config = ledger::ClusterConfig::load_file(config_path);
-    ledger::Node node(std::move(config), static_cast<ledger::NodeId>(id));
+    auto genesis = ledger::Genesis::load_file(genesis_path);
+    ledger::Node node(std::move(config), static_cast<ledger::NodeId>(id), genesis);
     node.run();
   } catch (const std::exception& e) {
     ledger::log_error("fatal", {{"error", e.what()}});
