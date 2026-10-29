@@ -3,6 +3,7 @@
 #include <sys/signalfd.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <csignal>
 #include <random>
 #include <stdexcept>
@@ -33,6 +34,7 @@ raft::RaftConfig Node::make_raft_config() const {
   rc.election_timeout_min = static_cast<int>(config_.raft.election_ticks_min);
   rc.election_timeout_max = static_cast<int>(config_.raft.election_ticks_max);
   rc.heartbeat_interval = static_cast<int>(config_.raft.heartbeat_ticks);
+  rc.max_entries_per_append = config_.raft.max_entries_per_append;
   // Real nodes want different timeouts on every run; only the simulator needs
   // reproducible seeds.
   rc.seed = (static_cast<uint64_t>(std::random_device{}()) << 32) ^ self_;
@@ -93,15 +95,19 @@ void Node::on_tick() {
   process_ready();
 }
 
-// The host half of the Ready contract: persist first, then send. Persisting
-// is in memory for now; week 5 makes it a write + fsync, and because the
-// order is already right here nothing else has to change.
+// The host half of the Ready contract: persist, then send, then apply.
+// Persisting is in memory for now; week 5 makes it a write + fsync, and
+// because the order is already right here nothing else has to change.
 void Node::process_ready() {
   if (!raft_.has_ready()) return;
   raft::Ready rd = raft_.ready();
 
   if (rd.hard_state) hard_state_ = *rd.hard_state;
-  for (auto& e : rd.entries) log_.push_back(std::move(e));
+  if (!rd.entries.empty()) {
+    // New entries replace anything stored from their first index on.
+    log_.resize(std::min<size_t>(log_.size(), rd.entries.front().index() - 1));
+    for (auto& e : rd.entries) log_.push_back(std::move(e));
+  }
 
   for (auto& m : rd.messages) {
     NodeId to = m.to();
@@ -109,6 +115,13 @@ void Node::process_ready() {
     *env.mutable_raft() = std::move(m);
     peers_.send(to, env);  // may drop (down, blocked); Raft copes with loss
   }
+
+  for (const auto& e : rd.committed_entries) apply(e);
+
+  // Reads go last: the entries above bring applied_index_ up to (at least)
+  // each read's index.
+  for (const auto& rs : rd.reads_ready) finish_read(rs.request_id, &rs);
+  for (uint64_t id : rd.reads_failed) finish_read(id, nullptr);
 
   if (raft_.role() != logged_role_ || raft_.term() != logged_term_ ||
       raft_.leader() != logged_leader_) {
@@ -120,6 +133,56 @@ void Node::process_ready() {
                             {"leader", logged_leader_},
                             {"last_log_index", raft_.log().last_index()}});
   }
+}
+
+void Node::apply(const pb::LogEntry& e) {
+  // FNV-1a over (index, term, data), chained from the previous hash. Cheap
+  // and deterministic; a stand-in for the ledger's SHA-256 state hash.
+  auto mix = [this](const void* p, size_t n) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) applied_hash_ = (applied_hash_ ^ b[i]) * 1099511628211ULL;
+  };
+  if (applied_hash_ == 0) applied_hash_ = 14695981039346656037ULL;
+  uint64_t index = e.index(), term = e.term();
+  mix(&index, sizeof index);
+  mix(&term, sizeof term);
+  mix(e.data().data(), e.data().size());
+  applied_index_ = e.index();
+  log_debug("apply", {{"index", index}, {"term", term}, {"bytes", e.data().size()}});
+}
+
+void Node::start_read(net::Connection& conn) {
+  const uint64_t id = ++next_read_id_;
+  if (!raft_.read_index(id)) {
+    pb::Envelope resp;
+    resp.mutable_read_resp()->set_error("not leader");
+    resp.mutable_read_resp()->set_leader_hint(raft_.leader());
+    conn.send_frame(resp.SerializeAsString());
+    return;
+  }
+  pending_reads_[id] = conn.id();
+  process_ready();  // sends the confirmation round now
+}
+
+void Node::finish_read(uint64_t read_id, const raft::ReadState* ok) {
+  auto it = pending_reads_.find(read_id);
+  if (it == pending_reads_.end()) return;
+  auto conn = clients_.find(it->second);
+  pending_reads_.erase(it);
+  if (conn == clients_.end()) return;  // client gave up and disconnected
+
+  pb::Envelope resp;
+  auto* r = resp.mutable_read_resp();
+  if (ok) {
+    r->set_ok(true);
+    r->set_read_index(ok->index);
+    r->set_applied_index(applied_index_);
+    r->set_applied_hash(applied_hash_);
+  } else {
+    r->set_error("leadership lost, retry");
+    r->set_leader_hint(raft_.leader());
+  }
+  conn->second->send_frame(resp.SerializeAsString());
 }
 
 void Node::send_pings() {
@@ -189,6 +252,10 @@ void Node::on_client_frame(net::Connection& conn, std::string_view payload) {
     conn.close("unparseable frame");
     return;
   }
+  if (req.has_read_req()) {
+    start_read(conn);
+    return;
+  }
   std::string bytes;
   handle_admin(req).SerializeToString(&bytes);
   conn.send_frame(bytes);
@@ -203,6 +270,20 @@ pb::Envelope Node::handle_admin(const pb::Envelope& req) {
     case pb::Envelope::kGetStatus:
       *resp.mutable_status_resp() = build_status();
       break;
+    case pb::Envelope::kProposeReq: {
+      auto* pr = resp.mutable_propose_resp();
+      auto r = raft_.propose(req.propose_req().data());
+      if (!r) {
+        pr->set_error("not leader");
+        pr->set_leader_hint(raft_.leader());
+        break;
+      }
+      process_ready();  // start replicating now, not on the next tick
+      pr->set_accepted(true);
+      pr->set_index(r->index);
+      pr->set_term(r->term);
+      break;
+    }
     case pb::Envelope::kBlockPeer:
       if (!known_peer(req.block_peer().peer_id())) {
         resp.mutable_admin_resp()->set_error("unknown peer");
@@ -235,6 +316,9 @@ pb::StatusResp Node::build_status() const {
   s.set_term(raft_.term());
   s.set_leader(raft_.leader());
   s.set_last_log_index(raft_.log().last_index());
+  s.set_commit_index(raft_.commit_index());
+  s.set_applied_index(applied_index_);
+  s.set_applied_hash(applied_hash_);
   uint64_t now = now_ms();
   for (const auto& [id, h] : health_) {
     pb::PeerStatus* p = s.add_peers();

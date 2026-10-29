@@ -23,5 +23,9 @@ message Envelope {
     GetStatus get_status = 23;
     AdminResp admin_resp = 24;
     StatusResp status_resp = 25;
+    ProposeReq propose_req = 26;
+    ProposeResp propose_resp = 27;
+    ReadReq read_req = 28;
+    ReadResp read_resp = 29;
   }
 }

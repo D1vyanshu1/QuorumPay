@@ -6,6 +6,8 @@
 //   ledger-admin --node 1 block 3
 //   ledger-admin --node 1 unblock 3
 //   ledger-admin --node 1 unblock-all
+//   ledger-admin --node 1 propose <text>   # test hook: append to the Raft log
+//   ledger-admin --node 1 read             # linearizable read (ReadIndex)
 //
 // A CLI that sends one request and exits has nothing else to do while it
 // waits, so plain blocking sockets are fine here (unlike in the node).
@@ -30,7 +32,7 @@ namespace {
 
 int usage() {
   std::cerr << "usage: ledger-admin [--config cluster.json] --node N "
-               "status | block <peer> | unblock <peer> | unblock-all\n";
+               "status | block <peer> | unblock <peer> | unblock-all | propose <text> | read\n";
   return 2;
 }
 
@@ -104,6 +106,10 @@ int main(int argc, char** argv) {
     req.mutable_unblock_peer()->set_peer_id(std::stoul(args[1]));
   } else if (cmd == "unblock-all" && args.size() == 1) {
     req.mutable_unblock_all();
+  } else if (cmd == "read" && args.size() == 1) {
+    req.mutable_read_req();
+  } else if (cmd == "propose" && args.size() == 2) {
+    req.mutable_propose_req()->set_data(args[1]);
   } else {
     return usage();
   }
@@ -145,6 +151,9 @@ int main(int argc, char** argv) {
                           {"term", s.term()},
                           {"leader", s.leader()},
                           {"last_log_index", s.last_log_index()},
+                          {"commit_index", s.commit_index()},
+                          {"applied_index", s.applied_index()},
+                          {"applied_hash", s.applied_hash()},
                           {"peers", nlohmann::json::array()}};
     for (const auto& p : s.peers()) {
       out["peers"].push_back({{"id", p.id()},
@@ -156,6 +165,24 @@ int main(int argc, char** argv) {
     }
     std::cout << out.dump() << "\n";
     return 0;
+  }
+  if (resp.has_read_resp()) {
+    const auto& r = resp.read_resp();
+    nlohmann::json out = {{"ok", r.ok()},
+                          {"read_index", r.read_index()},
+                          {"applied_index", r.applied_index()},
+                          {"applied_hash", r.applied_hash()},
+                          {"leader_hint", r.leader_hint()},
+                          {"error", r.error()}};
+    std::cout << out.dump() << "\n";
+    return r.ok() ? 0 : 3;
+  }
+  if (resp.has_propose_resp()) {
+    const auto& p = resp.propose_resp();
+    nlohmann::json out = {{"accepted", p.accepted()}, {"index", p.index()}, {"term", p.term()},
+                          {"leader_hint", p.leader_hint()}, {"error", p.error()}};
+    std::cout << out.dump() << "\n";
+    return p.accepted() ? 0 : 3;  // 3 = not leader (try leader_hint)
   }
   if (resp.has_admin_resp()) {
     if (resp.admin_resp().ok()) {

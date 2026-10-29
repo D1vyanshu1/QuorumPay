@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <vector>
 
 #include "common/types.h"
@@ -28,6 +29,21 @@ class RaftLog {
 
   // Appends at last_index + 1; the entry's index field must already be set to it.
   void append(const pb::LogEntry& entry);
+
+  // Removes `index` and everything after it. Raft only ever does this to
+  // uncommitted entries that conflict with the leader's log.
+  void truncate_from(LogIndex index);
+
+  // Up to `max` entries starting at `from` (empty if from > last_index).
+  std::vector<pb::LogEntry> slice(LogIndex from, size_t max) const;
+
+  // The first index of the run of same-term entries that contains `index`.
+  // A follower returns it as a hint so the leader can skip a whole
+  // conflicting term in one round trip instead of one entry at a time.
+  LogIndex first_index_of_term_at(LogIndex index) const;
+
+  // The last index holding an entry of `term`, if any.
+  std::optional<LogIndex> last_index_of_term(Term term) const;
 
   // Raft's "at least as up to date" rule (§5.4.1): a later last term wins; with
   // equal last terms, the longer log wins.

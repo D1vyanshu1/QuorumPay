@@ -17,6 +17,34 @@ message UnblockAll {}
 
 message GetStatus {}
 
+// Test hook until ledger-cli exists (step 6): append opaque bytes to the Raft
+// log. Answered as soon as the leader has appended it, not when committed.
+message ProposeReq {
+  bytes data = 1;
+}
+
+// Linearizable read (ReadIndex) of the node's state. Answered only after the
+// leader has confirmed with a majority that it is still leader, so it never
+// returns stale data. A cut-off old leader never answers at all.
+message ReadReq {}
+
+message ReadResp {
+  bool ok = 1;
+  uint64 read_index = 2;     // commit index the read was taken at
+  uint64 applied_index = 3;  // state the answer reflects (>= read_index)
+  uint64 applied_hash = 4;
+  uint32 leader_hint = 5;
+  string error = 6;
+}
+
+message ProposeResp {
+  bool accepted = 1;
+  uint64 index = 2;
+  uint64 term = 3;
+  uint32 leader_hint = 4;  // set when rejected because this node isn't leader
+  string error = 5;
+}
+
 message AdminResp {
   bool ok = 1;
   string error = 2;
@@ -38,4 +66,9 @@ message StatusResp {
   uint64 term = 4;
   uint32 leader = 5;        // 0 = unknown
   uint64 last_log_index = 6;
+  uint64 commit_index = 7;
+  uint64 applied_index = 8;
+  // Running hash over every applied entry. Equal applied_index + equal hash
+  // on two nodes = they applied the same entries.
+  uint64 applied_hash = 9;
 }

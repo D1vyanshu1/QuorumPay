@@ -22,7 +22,11 @@ namespace ledger {
 // One ledger node process. It hosts a RaftCore on top of the network layer:
 //
 //   timer tick ──▶ raft_.tick() ─┐
-//   Raft message ─▶ raft_.step() ─┴─▶ process_ready(): persist, then send
+//   Raft message ─▶ raft_.step() ─┴─▶ process_ready(): persist, send, apply
+//
+// Committed entries are "applied" by folding them into a running hash (the
+// ledger state machine replaces this in step 5), so `status` can show that
+// all nodes applied the same log.
 //
 // Separately it pings every peer each heartbeat to measure reachability and
 // RTT for `status` (a network-health probe; Raft doesn't use it), and serves
@@ -47,6 +51,7 @@ class Node {
 
   raft::RaftConfig make_raft_config() const;
   void process_ready();
+  void apply(const pb::LogEntry& e);
 
   void on_tick();
   void send_pings();
@@ -56,6 +61,9 @@ class Node {
   void on_client_accept(int fd, std::string remote);
   void on_client_frame(net::Connection& conn, std::string_view payload);
   pb::Envelope handle_admin(const pb::Envelope& req);
+  // Reads are answered later, once Raft confirms them; see pending_reads_.
+  void start_read(net::Connection& conn);
+  void finish_read(uint64_t read_id, const raft::ReadState* ok);
   pb::StatusResp build_status() const;
 
   ClusterConfig config_;
@@ -76,6 +84,15 @@ class Node {
   // forgetting a vote can in theory allow a double vote in one term.
   raft::HardState hard_state_;
   std::vector<pb::LogEntry> log_;
+  // The "state machine" for now. Volatile, like the log: rebuilt by
+  // re-applying from index 1 after a restart.
+  LogIndex applied_index_ = 0;
+  uint64_t applied_hash_ = 0;
+
+  // Reads waiting for Raft's confirmation: read id -> client connection id.
+  // The connection is looked up again on completion; it may have gone away.
+  uint64_t next_read_id_ = 0;
+  std::unordered_map<uint64_t, uint64_t> pending_reads_;
   // Last role/term/leader logged, so only changes are logged.
   raft::Role logged_role_ = raft::Role::kFollower;
   Term logged_term_ = 0;

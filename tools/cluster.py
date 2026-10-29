@@ -7,6 +7,8 @@
     tools/cluster.py restart 3
     tools/cluster.py partition 1,2 3,4,5
     tools/cluster.py heal
+    tools/cluster.py propose hello      # append to the Raft log via the leader
+    tools/cluster.py read [node]        # linearizable read (default: the leader)
     tools/cluster.py stop               # SIGTERM all
 
 Each node's log goes to data/node-N/node.log; its pid to data/node-N/pid.
@@ -102,6 +104,42 @@ class Cluster:
     def status(self, nid):
         return json.loads(self.admin(nid, "status"))
 
+    def leader(self):
+        """The node that the most live nodes name as leader, or None."""
+        votes = {}
+        for nid in self.nodes:
+            if not self.is_running(nid):
+                continue
+            try:
+                lead = self.status(nid)["leader"]
+            except Exception:  # noqa: BLE001 - node may be mid-restart
+                continue
+            if lead:
+                votes[lead] = votes.get(lead, 0) + 1
+        return max(votes, key=votes.get) if votes else None
+
+    def propose(self, data, node=None):
+        """Propose on `node` (default: the leader). Returns the JSON reply;
+        accepted=false with leader_hint if `node` isn't the leader."""
+        nid = node or self.leader()
+        if nid is None:
+            raise RuntimeError("no leader")
+        out = subprocess.run(
+            [os.path.join(self.build_dir, "ledger-admin"),
+             "--config", self.config_path, "--node", str(nid), "propose", data],
+            capture_output=True, text=True, timeout=5)
+        return json.loads(out.stdout)
+
+    def read(self, node=None):
+        """Linearizable read on `node` (default: the leader). Returns the JSON
+        reply, or None if the node never answered (e.g. a cut-off old leader)."""
+        nid = node or self.leader()
+        out = subprocess.run(
+            [os.path.join(self.build_dir, "ledger-admin"),
+             "--config", self.config_path, "--node", str(nid), "read"],
+            capture_output=True, text=True, timeout=5)
+        return json.loads(out.stdout) if out.stdout.strip() else None
+
     def partition(self, *groups):
         """partition([1,2],[3,4,5]): every node blocks every node outside its group."""
         everyone = [n for g in groups for n in g]
@@ -133,7 +171,9 @@ def print_status(cluster):
             rtt = f" {p['rtt_us']}us" if p["reachable"] else ""
             parts.append(f"{p['id']}:{mark}{rtt}")
         leader = s["leader"] or "?"
-        raft = f"{s['role']:<9} term {s['term']:<3} leader {leader}"
+        raft = (f"{s['role']:<9} term {s['term']:<3} leader {leader}  "
+                f"log {s['last_log_index']:<4} commit {s['commit_index']:<4} "
+                f"applied {s['applied_index']:<4} hash {s['applied_hash'] % 10**6:06d}")
         print(f"node {nid}: {raft} | peers " + "  ".join(parts))
 
 
@@ -147,7 +187,8 @@ def main():
     ap.add_argument("--config", default="config/cluster.json")
     ap.add_argument("--build-dir", default="build")
     ap.add_argument("command",
-                    choices=["start", "stop", "kill", "restart", "status", "partition", "heal"])
+                    choices=["start", "stop", "kill", "restart", "status", "partition", "heal",
+                             "propose", "read"])
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
 
@@ -168,6 +209,10 @@ def main():
         c.partition(*[[int(x) for x in g.split(",")] for g in a.args])
     elif a.command == "heal":
         c.heal()
+    elif a.command == "read":
+        print(json.dumps(c.read(int(a.args[0]) if a.args else None)))
+    elif a.command == "propose":
+        print(json.dumps(c.propose(" ".join(a.args) or "hello")))
 
 
 if __name__ == "__main__":
