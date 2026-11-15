@@ -322,3 +322,50 @@ TEST(StateMachine, SameEntriesSameHashAndMoneyIsConserved) {
   b.apply(transfer("faucet", "alice", 1, b.nonce("faucet"), key('f')));
   EXPECT_NE(a.sm.state_hash(), b.sm.state_hash());
 }
+
+// ---------------------------------------------------------------- prevalidate
+// The leader's pre-check (steps 1-4, read-only). apply() stays the authority.
+
+TEST(StateMachine, PrevalidateAcceptsValidAndChangesNothing) {
+  Ledger l;
+  const std::string before = l.sm.state_hash();
+  EXPECT_EQ(l.sm.prevalidate(transfer("alice", "faucet", 30, 0, key('a')), true), TxStatus::kOk);
+  EXPECT_EQ(l.sm.prevalidate(create("bob", key('b'), key('b')), true), TxStatus::kOk);
+  EXPECT_EQ(l.sm.state_hash(), before);
+  EXPECT_EQ(l.nonce("alice"), 0u);
+}
+
+TEST(StateMachine, PrevalidateRejectsRows1To4) {
+  Ledger l;
+  EXPECT_EQ(l.sm.prevalidate(transfer("alice", "alice", 30, 0, key('a')), true),
+            TxStatus::kMalformed);
+  EXPECT_EQ(l.sm.prevalidate(transfer("nobody", "alice", 30, 0, key('n')), true),
+            TxStatus::kUnknownAccount);
+  EXPECT_EQ(l.sm.prevalidate(create("alice", key('x'), key('x')), true),
+            TxStatus::kDuplicateAccount);
+  EXPECT_EQ(l.sm.prevalidate(transfer("alice", "faucet", 30, 0, key('x')), true),
+            TxStatus::kBadSignature);
+  l.apply(transfer("alice", "faucet", 1, 0, key('a')));
+  EXPECT_EQ(l.sm.prevalidate(transfer("alice", "faucet", 1, 0, key('a')), true),
+            TxStatus::kBadNonce);  // nonce 0 is used up
+}
+
+TEST(StateMachine, PrevalidatePassesNonceAheadAndLeavesFundsToApply) {
+  Ledger l;
+  // Nonce ahead: earlier transactions may still be in the log.
+  EXPECT_EQ(l.sm.prevalidate(transfer("alice", "faucet", 1, 3, key('a')), true), TxStatus::kOk);
+  // Not enough money, or no such receiver: only apply() may fail these,
+  // because only apply() can use up the nonce.
+  EXPECT_EQ(l.sm.prevalidate(transfer("alice", "faucet", 5000, 0, key('a')), true),
+            TxStatus::kOk);
+  EXPECT_EQ(l.sm.prevalidate(transfer("alice", "nobody", 5, 0, key('a')), true), TxStatus::kOk);
+}
+
+TEST(StateMachine, PrevalidateWithoutStateChecksOnlyShape) {
+  Ledger l;
+  // A new leader whose state may lag: an account it hasn't seen yet may
+  // exist, so only stateless checks may reject.
+  EXPECT_EQ(l.sm.prevalidate(transfer("newbie", "alice", 1, 0, key('n')), false), TxStatus::kOk);
+  EXPECT_EQ(l.sm.prevalidate(transfer("alice", "alice", 1, 0, key('a')), false),
+            TxStatus::kMalformed);
+}

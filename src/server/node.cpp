@@ -22,7 +22,9 @@ Node::Node(ClusterConfig config, NodeId self, const Genesis& genesis)
       // Nothing on disk yet (week 5 loads HardState + log here). Note raft_ is
       // declared before hard_state_/log_, so it must not read them here.
       raft_(make_raft_config(), raft::HardState{}, {}),
-      ledger_(genesis) {
+      ledger_(genesis),
+      service_(raft_, ledger_,
+               [this](uint64_t cid, const pb::Envelope& m) { reply_to_client(cid, m); }) {
   if (config_.find(self_) == nullptr) {
     throw std::runtime_error("node id " + std::to_string(self_) + " not in cluster config");
   }
@@ -101,7 +103,10 @@ void Node::on_tick() {
 // Persisting is in memory for now; week 5 makes it a write + fsync, and
 // because the order is already right here nothing else has to change.
 void Node::process_ready() {
-  if (!raft_.has_ready()) return;
+  if (!raft_.has_ready()) {
+    service_.after_ready();
+    return;
+  }
   raft::Ready rd = raft_.ready();
 
   if (rd.hard_state) hard_state_ = *rd.hard_state;
@@ -118,12 +123,17 @@ void Node::process_ready() {
     peers_.send(to, env);  // may drop (down, blocked); Raft copes with loss
   }
 
-  for (const auto& e : rd.committed_entries) apply(e);
+  for (const auto& e : rd.committed_entries) {
+    apply(e);
+    service_.on_applied(e);  // answers the client that submitted it, if any
+  }
 
   // Reads go last: the entries above bring the ledger up to (at least)
   // each read's index.
-  for (const auto& rs : rd.reads_ready) finish_read(rs.request_id, &rs);
-  for (uint64_t id : rd.reads_failed) finish_read(id, nullptr);
+  for (const auto& rs : rd.reads_ready) service_.on_read(rs.request_id, &rs);
+  for (uint64_t id : rd.reads_failed) service_.on_read(id, nullptr);
+  // Leadership may have changed: submits this node can't finish get RETRY.
+  service_.after_ready();
 
   if (raft_.role() != logged_role_ || raft_.term() != logged_term_ ||
       raft_.leader() != logged_leader_) {
@@ -146,39 +156,12 @@ void Node::apply(const pb::LogEntry& e) {
   }
 }
 
-void Node::start_read(net::Connection& conn) {
-  const uint64_t id = ++next_read_id_;
-  if (!raft_.read_index(id)) {
-    pb::Envelope resp;
-    resp.mutable_read_resp()->set_error("not leader");
-    resp.mutable_read_resp()->set_leader_hint(raft_.leader());
-    conn.send_frame(resp.SerializeAsString());
-    return;
-  }
-  pending_reads_[id] = conn.id();
-  process_ready();  // sends the confirmation round now
-}
-
-void Node::finish_read(uint64_t read_id, const raft::ReadState* ok) {
-  auto it = pending_reads_.find(read_id);
-  if (it == pending_reads_.end()) return;
-  auto conn = clients_.find(it->second);
-  pending_reads_.erase(it);
-  if (conn == clients_.end()) return;  // client gave up and disconnected
-
-  pb::Envelope resp;
-  auto* r = resp.mutable_read_resp();
-  if (ok) {
-    r->set_ok(true);
-    r->set_read_index(ok->index);
-    r->set_applied_index(ledger_.last_applied());
-    r->set_state_hash(to_hex(ledger_.state_hash()));
-    r->set_total_supply(ledger_.total_supply());
-  } else {
-    r->set_error("leadership lost, retry");
-    r->set_leader_hint(raft_.leader());
-  }
-  conn->second->send_frame(resp.SerializeAsString());
+// Replies can come long after the request (a submit waits for its commit), so
+// the connection is looked up again: the client may have given up and gone.
+void Node::reply_to_client(uint64_t conn_id, const pb::Envelope& msg) {
+  auto it = clients_.find(conn_id);
+  if (it == clients_.end()) return;
+  it->second->send_frame(msg.SerializeAsString());
 }
 
 void Node::send_pings() {
@@ -248,8 +231,8 @@ void Node::on_client_frame(net::Connection& conn, std::string_view payload) {
     conn.close("unparseable frame");
     return;
   }
-  if (req.has_read_req()) {
-    start_read(conn);
+  if (service_.handle(conn.id(), req)) {
+    process_ready();  // replicate a proposal / start a read round now, not next tick
     return;
   }
   std::string bytes;

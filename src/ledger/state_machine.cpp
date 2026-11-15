@@ -104,6 +104,29 @@ TxStatus StateMachine::execute(const Transaction& t, const std::string& tx_id, L
   return TxStatus::kOk;
 }
 
+TxStatus StateMachine::prevalidate(const Transaction& t, bool check_state) const {
+  if (!well_formed(t)) return TxStatus::kMalformed;
+  if (!check_state) return TxStatus::kOk;
+
+  if (t.type == TxType::kCreateAccount) {
+    if (accounts_.find(t.sender)) return TxStatus::kDuplicateAccount;
+    if (!crypto::verify(t.signing_bytes(), t.signature, t.public_key)) {
+      return TxStatus::kBadSignature;
+    }
+    if (t.nonce != 0) return TxStatus::kBadNonce;
+    return TxStatus::kOk;
+  }
+
+  const Account* from = accounts_.find(t.sender);
+  if (!from) return TxStatus::kUnknownAccount;
+  if (!crypto::verify(t.signing_bytes(), t.signature, from->public_key)) {
+    return TxStatus::kBadSignature;
+  }
+  // Already used: can never apply. Ahead: may apply once the gap fills.
+  if (t.nonce < from->next_nonce) return TxStatus::kBadNonce;
+  return TxStatus::kOk;
+}
+
 bool StateMachine::well_formed(const Transaction& t) const {
   if (t.chain_id != chain_id_) return false;  // meant for another ledger
   if (!is_valid_account_name(t.sender)) return false;

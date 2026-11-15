@@ -17,21 +17,23 @@
 #include "net/listener.h"
 #include "net/peer_manager.h"
 #include "raft/raft_core.h"
+#include "server/client_service.h"
 
 namespace ledger {
 
 // One ledger node process. It hosts a RaftCore on top of the network layer:
 //
 //   timer tick ──▶ raft_.tick() ─┐
-//   Raft message ─▶ raft_.step() ─┴─▶ process_ready(): persist, send, apply
+//   Raft message ─▶ raft_.step() ─┼─▶ process_ready(): persist, send, apply,
+//   client request ─▶ service_ ───┘     then tell service_ (replies, reads)
 //
 // Committed entries are applied to the ledger state machine, built from the
 // same genesis on every node; `status` shows its state hash so you can see
 // that all nodes hold identical balances.
 //
 // Separately it pings every peer each heartbeat to measure reachability and
-// RTT for `status` (a network-health probe; Raft doesn't use it), and serves
-// admin commands on its client port.
+// RTT for `status` (a network-health probe; Raft doesn't use it). Its client
+// port serves the ledger API (ClientService) and admin commands.
 class Node {
  public:
   // A peer counts as unreachable if no Pong arrived within this window
@@ -62,10 +64,8 @@ class Node {
   void on_client_accept(int fd, std::string remote);
   void on_client_frame(net::Connection& conn, std::string_view payload);
   pb::Envelope handle_admin(const pb::Envelope& req);
-  // Reads are answered later, once Raft confirms them; see pending_reads_.
-  void start_read(net::Connection& conn);
-  void finish_read(uint64_t read_id, const raft::ReadState* ok);
   pb::StatusResp build_status() const;
+  void reply_to_client(uint64_t conn_id, const pb::Envelope& msg);
 
   ClusterConfig config_;
   NodeId self_;
@@ -88,11 +88,9 @@ class Node {
   // The replicated ledger. Volatile until week 5, like the log: after a
   // restart it is rebuilt from genesis by re-applying committed entries.
   ledger::StateMachine ledger_;
+  // Declared after raft_ and ledger_, which it holds references to.
+  server::ClientService service_;
 
-  // Reads waiting for Raft's confirmation: read id -> client connection id.
-  // The connection is looked up again on completion; it may have gone away.
-  uint64_t next_read_id_ = 0;
-  std::unordered_map<uint64_t, uint64_t> pending_reads_;
   // Last role/term/leader logged, so only changes are logged.
   raft::Role logged_role_ = raft::Role::kFollower;
   Term logged_term_ = 0;

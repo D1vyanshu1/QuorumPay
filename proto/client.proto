@@ -2,8 +2,100 @@ syntax = "proto3";
 
 package ledger.pb;
 
-// Messages on a node's client port. Ledger requests (SubmitTx, GetBalance, ...)
-// are added later; for now only the admin commands used by the test harness.
+import "ledger.proto";
+
+// Messages on a node's client port: the ledger API used by ledger-cli
+// (SubmitTx, GetAccount, GetHistory, GetTx) and the admin commands used by the
+// test harness.
+
+// ---------------------------------------------------------------- ledger API
+
+// How the node handled a request. This is separate from a transaction's own
+// outcome (tx_status: OK, BAD_NONCE, ...): a request can be handled fine and
+// its transaction still fail.
+enum RespCode {
+  RESP_OK = 0;          // handled; see the other fields
+  RESP_NOT_LEADER = 1;  // only the leader serves this; try leader_hint (0 = unknown)
+  RESP_RETRY = 2;       // leadership changed before the outcome was known: resend
+                        // the same request (for SubmitTx, the same signed bytes)
+  RESP_REJECTED = 3;    // the leader's pre-check refused the transaction (tx_status
+                        // says why); it never entered the log
+}
+
+// Answered once the transaction is applied, not when it is appended: the reply
+// carries its real result. Resending the same signed bytes is always safe: a
+// transaction that already took effect is never applied again, and the reply
+// is its original result.
+message SubmitTx {
+  Transaction tx = 1;
+}
+
+message SubmitTxResp {
+  RespCode code = 1;
+  uint32 leader_hint = 2;
+  bytes tx_id = 3;
+  uint64 log_index = 4;  // where it was applied (RESP_OK)
+  uint32 tx_status = 5;  // ledger::TxStatus (RESP_OK, RESP_REJECTED)
+  string error = 6;
+}
+
+// Reads are linearizable by default: only the leader answers, after a
+// ReadIndex round. With stale = true any node answers from its own state,
+// which may lag behind (applied_index says how far it is).
+message GetAccount {
+  string name = 1;
+  bool stale = 2;
+}
+
+message AccountResp {
+  RespCode code = 1;
+  uint32 leader_hint = 2;
+  bool found = 3;
+  string name = 4;
+  uint64 balance = 5;
+  uint64 next_nonce = 6;  // the nonce the account's next transaction must carry
+  bytes public_key = 7;
+  uint64 applied_index = 8;
+}
+
+message GetHistory {
+  string name = 1;
+  uint32 limit = 2;  // newest `limit` records; 0 = all
+  bool stale = 3;
+}
+
+message HistoryItem {
+  uint64 index = 1;
+  bytes tx_id = 2;
+  string counterparty = 3;
+  uint64 amount = 4;
+  bool incoming = 5;
+}
+
+message HistoryResp {
+  RespCode code = 1;
+  uint32 leader_hint = 2;
+  bool found = 3;
+  repeated HistoryItem records = 4;  // oldest first
+  uint64 applied_index = 5;
+}
+
+message GetTx {
+  bytes tx_id = 1;
+  bool stale = 2;
+}
+
+message TxResp {
+  RespCode code = 1;
+  uint32 leader_hint = 2;
+  bool found = 3;     // applied: log_index and tx_status are set
+  bool pending = 4;   // not applied yet, but in this leader's log
+  uint64 log_index = 5;
+  uint32 tx_status = 6;
+  uint64 applied_index = 7;
+}
+
+// ---------------------------------------------------------------- admin
 
 message BlockPeer {
   uint32 peer_id = 1;
@@ -17,8 +109,9 @@ message UnblockAll {}
 
 message GetStatus {}
 
-// Test hook until ledger-cli exists (step 6): append opaque bytes to the Raft
-// log. Answered as soon as the leader has appended it, not when committed.
+// Test hook: append opaque bytes to the Raft log (they apply as MALFORMED).
+// Answered as soon as the leader has appended it, not when committed. Real
+// transactions go through SubmitTx.
 message ProposeReq {
   bytes data = 1;
 }

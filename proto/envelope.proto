@@ -27,5 +27,15 @@ message Envelope {
     ProposeResp propose_resp = 27;
     ReadReq read_req = 28;
     ReadResp read_resp = 29;
+
+    // client port: ledger API
+    SubmitTx submit_tx = 40;
+    SubmitTxResp submit_tx_resp = 41;
+    GetAccount get_account = 42;
+    AccountResp account_resp = 43;
+    GetHistory get_history = 44;
+    HistoryResp history_resp = 45;
+    GetTx get_tx = 46;
+    TxResp tx_resp = 47;
   }
 }

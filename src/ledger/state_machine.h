@@ -54,6 +54,21 @@ class StateMachine {
   // get a deterministic result: garbage is simply MALFORMED.
   std::optional<ApplyResult> apply(const pb::LogEntry& entry);
 
+  // The leader's cheap filter before it proposes a transaction: steps 1-4 of
+  // the pipeline against the current state, changing nothing. It keeps junk
+  // out of the log; apply() stays the only authority.
+  //
+  // Differences from apply(), on purpose:
+  //  - A nonce AHEAD of the next one passes. Earlier transactions from the
+  //    same sender may still be in the log, waiting to apply.
+  //  - Steps 5-6 (receiver, funds) are not checked. Those failures must use
+  //    up the nonce, which only apply() can do. Rejecting here would leave
+  //    the signed transfer valid, to succeed if someone resends it later,
+  //    after the user was told it failed.
+  // With check_state = false only step 1 (well-formed) runs: a new leader
+  // uses that until its state has caught up with the commit index.
+  TxStatus prevalidate(const Transaction& t, bool check_state) const;
+
   const Account* account(std::string_view name) const { return accounts_.find(name); }
   const AccountStore& accounts() const { return accounts_; }
   std::optional<TxRecord> tx(std::string_view tx_id) const;

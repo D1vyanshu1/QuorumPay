@@ -1,6 +1,6 @@
 // ledger-admin: sends one admin command to a node's client port and prints
 // the reply. Used by tools/cluster.py to inspect nodes and inject partitions.
-// (Folded into ledger-cli once the client library exists.)
+// Unlike ledger-cli it never redirects: it talks to exactly the node given.
 //
 //   ledger-admin --node 1 status
 //   ledger-admin --node 1 block 3
@@ -8,25 +8,16 @@
 //   ledger-admin --node 1 unblock-all
 //   ledger-admin --node 1 propose <text>   # test hook: append to the Raft log
 //   ledger-admin --node 1 read             # linearizable read (ReadIndex)
-//
-// A CLI that sends one request and exits has nothing else to do while it
-// waits, so plain blocking sockets are fine here (unlike in the node).
-
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 #include <cstdlib>
-#include <cstring>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
+#include "client/client_lib.h"
 #include "common/config.h"
 #include "envelope.pb.h"
-#include "net/framing.h"
 
 namespace {
 
@@ -34,52 +25,6 @@ int usage() {
   std::cerr << "usage: ledger-admin [--config cluster.json] --node N "
                "status | block <peer> | unblock <peer> | unblock-all | propose <text> | read\n";
   return 2;
-}
-
-int connect_to(const std::string& host, uint16_t port) {
-  addrinfo hints{};
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  addrinfo* res = nullptr;
-  if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return -1;
-  int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (fd >= 0) {
-    timeval tv{2, 0};  // don't hang forever on a stopped (SIGSTOP) node
-    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    if (::connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
-      ::close(fd);
-      fd = -1;
-    }
-  }
-  ::freeaddrinfo(res);
-  return fd;
-}
-
-bool send_all(int fd, const std::string& data) {
-  size_t off = 0;
-  while (off < data.size()) {
-    ssize_t n = ::send(fd, data.data() + off, data.size() - off, MSG_NOSIGNAL);
-    if (n <= 0) return false;
-    off += static_cast<size_t>(n);
-  }
-  return true;
-}
-
-bool recv_frame(int fd, std::string* payload) {
-  std::string buf;
-  char chunk[4096];
-  while (true) {
-    auto r = ledger::net::decode_frame(buf);
-    if (r.status == ledger::net::DecodeStatus::kFrame) {
-      *payload = std::string(r.payload);
-      return true;
-    }
-    if (r.status == ledger::net::DecodeStatus::kTooLarge) return false;
-    ssize_t n = ::recv(fd, chunk, sizeof chunk, 0);
-    if (n <= 0) return false;
-    buf.append(chunk, static_cast<size_t>(n));
-  }
 }
 
 }  // namespace
@@ -127,21 +72,13 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  int fd = connect_to(target->host, target->client_port);
-  if (fd < 0) {
-    std::cerr << "cannot connect to node " << node << ": " << std::strerror(errno) << "\n";
-    return 1;
-  }
-  std::string frame;
-  ledger::net::append_frame(frame, req.SerializeAsString());
-  std::string payload;
-  bool ok = send_all(fd, frame) && recv_frame(fd, &payload);
-  ::close(fd);
-  ledger::pb::Envelope resp;
-  if (!ok || !resp.ParseFromString(payload)) {
+  // 2s: don't hang forever on a stopped (SIGSTOP) node or a cut-off leader.
+  auto reply = ledger::client::call_node(*target, req, 2000);
+  if (!reply) {
     std::cerr << "no valid reply from node " << node << "\n";
     return 1;
   }
+  const ledger::pb::Envelope& resp = *reply;
 
   if (resp.has_status_resp()) {
     // JSON so scripts can parse it.

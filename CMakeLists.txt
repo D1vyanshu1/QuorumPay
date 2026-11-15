@@ -114,23 +114,38 @@ target_link_libraries(ledger_storage
   PUBLIC ledger_crypto ledger_proto
   PRIVATE ledger_warnings)
 
+# ---------------------------------------------------------------- server
+# The ledger API on top of Raft + the state machine. Like RaftCore it does no
+# I/O itself (replies go through a callback), so unit tests link it directly.
+add_library(ledger_server STATIC
+  src/server/client_service.cpp)
+target_link_libraries(ledger_server
+  PUBLIC ledger_raft ledger_ledger
+  PRIVATE ledger_warnings)
+
+# ---------------------------------------------------------------- client
+# Talking to the cluster: connect, follow leader hints, retry, time out.
+add_library(ledger_client STATIC
+  src/client/client_lib.cpp)
+target_link_libraries(ledger_client
+  PUBLIC ledger_common ledger_proto ledger_net
+  PRIVATE ledger_warnings)
+
 # ---------------------------------------------------------------- binaries
 add_executable(ledger-node
   src/server/main.cpp
   src/server/node.cpp
-  src/server/client_service.cpp
   src/server/admin_service.cpp)
 target_link_libraries(ledger-node PRIVATE
-  ledger_net ledger_raft ledger_storage ledger_ledger ledger_warnings)
+  ledger_server ledger_net ledger_raft ledger_storage ledger_ledger ledger_warnings)
 
 add_executable(ledger-cli
   src/client/main.cpp
-  src/client/client_lib.cpp
   src/client/keystore.cpp)
-target_link_libraries(ledger-cli PRIVATE ledger_net ledger_ledger ledger_warnings)
+target_link_libraries(ledger-cli PRIVATE ledger_client ledger_ledger ledger_warnings)
 
 add_executable(ledger-admin src/client/admin_main.cpp)
-target_link_libraries(ledger-admin PRIVATE ledger_net ledger_warnings)
+target_link_libraries(ledger-admin PRIVATE ledger_client ledger_warnings)
 
 # ---------------------------------------------------------------- tests
 if(LEDGER_BUILD_TESTS)
@@ -153,9 +168,11 @@ if(LEDGER_BUILD_TESTS)
     tests/unit/wal_test.cpp
     tests/unit/raft_core_test.cpp
     tests/unit/genesis_test.cpp
-    tests/unit/transaction_test.cpp)
+    tests/unit/transaction_test.cpp
+    tests/unit/client_service_test.cpp)
   target_link_libraries(unit_tests PRIVATE
-    ledger_net ledger_ledger ledger_storage ledger_raft GTest::gtest_main ledger_warnings)
+    ledger_net ledger_ledger ledger_storage ledger_raft ledger_server
+    GTest::gtest_main ledger_warnings)
   target_compile_definitions(unit_tests PRIVATE LEDGER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   gtest_discover_tests(unit_tests)
 

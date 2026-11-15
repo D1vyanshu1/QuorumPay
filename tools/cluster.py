@@ -13,6 +13,7 @@
 
 Each node's log goes to data/node-N/node.log; its pid to data/node-N/pid.
 Run from the repo root. Binaries are taken from build/ (override: --build-dir).
+Nodes load config/genesis.json unless --genesis names another file.
 """
 
 import argparse
@@ -27,9 +28,10 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class Cluster:
-    def __init__(self, config_path="config/cluster.json", build_dir="build"):
+    def __init__(self, config_path="config/cluster.json", build_dir="build", genesis=None):
         self.config_path = os.path.join(REPO, config_path)
         self.build_dir = os.path.join(REPO, build_dir)
+        self.genesis = os.path.join(REPO, genesis) if genesis else None
         with open(self.config_path) as f:
             self.config = json.load(f)
         self.nodes = {n["id"]: n for n in self.config["nodes"]}
@@ -58,9 +60,12 @@ class Cluster:
             d = self._data_dir(nid)
             os.makedirs(d, exist_ok=True)
             log = open(os.path.join(d, "node.log"), "a")
+            cmd = [os.path.join(self.build_dir, "ledger-node"),
+                   "--config", self.config_path, "--id", str(nid)]
+            if self.genesis:
+                cmd += ["--genesis", self.genesis]
             proc = subprocess.Popen(
-                [os.path.join(self.build_dir, "ledger-node"),
-                 "--config", self.config_path, "--id", str(nid)],
+                cmd,
                 cwd=REPO, stdout=log, stderr=log,
                 start_new_session=True)  # Ctrl-C in this shell won't hit nodes
             with open(os.path.join(d, "pid"), "w") as f:
@@ -186,13 +191,14 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="config/cluster.json")
     ap.add_argument("--build-dir", default="build")
+    ap.add_argument("--genesis", help="genesis file for the nodes (default config/genesis.json)")
     ap.add_argument("command",
                     choices=["start", "stop", "kill", "restart", "status", "partition", "heal",
                              "propose", "read"])
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
 
-    c = Cluster(a.config, a.build_dir)
+    c = Cluster(a.config, a.build_dir, a.genesis)
     if a.command == "start":
         c.start(parse_ids(a.args))
     elif a.command == "stop":
