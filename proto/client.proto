@@ -107,6 +107,10 @@ message UnblockPeer {
 
 message UnblockAll {}
 
+// Snapshot the ledger now and compact the log (normally every snapshot_every
+// entries).
+message TakeSnapshot {}
+
 message GetStatus {}
 
 // Test hook: append opaque bytes to the Raft log (they apply as MALFORMED).
@@ -171,4 +175,6 @@ message StatusResp {
   string state_hash = 10;
   uint64 total_supply = 11;  // sum of balances; never changes (conservation)
   uint32 accounts = 12;
+  uint64 snapshot_index = 13;   // latest snapshot (0 = none)
+  uint64 first_log_index = 14;  // entries before this were compacted away
 }

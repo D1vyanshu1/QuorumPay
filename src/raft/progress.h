@@ -18,6 +18,12 @@ struct Progress {
   // in the next batch. The heartbeat resends anyway, which covers lost
   // messages. This bounds traffic to one batch in flight per follower.
   bool in_flight = false;
+
+  // Sending a snapshot (the follower needs entries we compacted away):
+  // which one, and how many bytes of it the follower has confirmed.
+  bool snapshotting = false;
+  LogIndex snap_index = 0;
+  uint64_t snap_offset = 0;
 };
 
 }  // namespace ledger::raft

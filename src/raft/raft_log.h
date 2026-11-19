@@ -11,12 +11,21 @@ namespace ledger::raft {
 // In-memory view of the Raft log. Indexes start at 1; index 0 with term 0 is
 // the empty "before the log" position, so prev_log_index = 0 always matches.
 //
-// After a snapshot (week 5) the entries up to snapshot_index are discarded and
-// entries_[0] holds index snapshot_index + 1. Until then both offsets are 0.
+// After compaction the entries up to snapshot_index are discarded and
+// entries_[0] holds index snapshot_index + 1. Only the term of the last
+// discarded entry is kept (snapshot_term), for the consistency check of the
+// entry right after it. Without compaction both are 0.
 class RaftLog {
  public:
   RaftLog() = default;
   explicit RaftLog(std::vector<pb::LogEntry> entries) : entries_(std::move(entries)) {}
+  // A log that starts after a snapshot at (index, term). `entries` must
+  // start at index + 1.
+  RaftLog(LogIndex index, Term term, std::vector<pb::LogEntry> entries)
+      : entries_(std::move(entries)), snapshot_index_(index), snapshot_term_(term) {}
+
+  LogIndex snapshot_index() const { return snapshot_index_; }
+  Term snapshot_term() const { return snapshot_term_; }
 
   LogIndex last_index() const { return snapshot_index_ + entries_.size(); }
   Term last_term() const { return entries_.empty() ? snapshot_term_ : entries_.back().term(); }
@@ -33,6 +42,10 @@ class RaftLog {
   // Removes `index` and everything after it. Raft only ever does this to
   // uncommitted entries that conflict with the leader's log.
   void truncate_from(LogIndex index);
+
+  // Discards the entries up to and including `index` (snapshot_index <
+  // index <= last_index); they are covered by a snapshot.
+  void compact_through(LogIndex index);
 
   // Up to `max` entries starting at `from` (empty if from > last_index).
   std::vector<pb::LogEntry> slice(LogIndex from, size_t max) const;

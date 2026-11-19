@@ -167,6 +167,7 @@ if(LEDGER_BUILD_TESTS)
     tests/unit/state_machine_test.cpp
     tests/unit/wal_test.cpp
     tests/unit/raft_core_test.cpp
+    tests/unit/raft_snapshot_test.cpp
     tests/unit/genesis_test.cpp
     tests/unit/transaction_test.cpp
     tests/unit/client_service_test.cpp)

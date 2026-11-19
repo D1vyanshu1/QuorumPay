@@ -27,6 +27,7 @@ message Envelope {
     ProposeResp propose_resp = 27;
     ReadReq read_req = 28;
     ReadResp read_resp = 29;
+    TakeSnapshot take_snapshot = 30;
 
     // client port: ledger API
     SubmitTx submit_tx = 40;

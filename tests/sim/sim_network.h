@@ -28,6 +28,13 @@ struct SimOptions {
   int election_timeout_min = 15;
   int election_timeout_max = 30;
 
+  // Snapshots (0 = never): each node snapshots its ledger every this many
+  // applied entries, compacts its log, and drops the covered entries from
+  // its disk. Small margin and chunks, so InstallSnapshot gets exercised.
+  uint64_t snapshot_every = 0;
+  LogIndex compaction_margin = 3;
+  size_t snapshot_chunk_bytes = 64;
+
   // Initial ledger state for every node's state machine. Entries that aren't
   // signed transactions (e.g. "tx-1" strings in Raft-only tests) are simply
   // MALFORMED there, which still exercises deterministic apply.
@@ -114,16 +121,27 @@ class SimCluster {
   LogIndex applied_index(NodeId id) const { return applied_index_.at(id); }
   // The node's ledger (volatile: rebuilt from genesis after a restart).
   const ledger::StateMachine& state(NodeId id) const { return *state_.at(id); }
-  // The node's persisted log (survives crashes).
+  // The node's persisted log (survives crashes). Starts after its snapshot.
   const std::vector<pb::LogEntry>& disk_log(NodeId id) const { return disks_.at(id).log; }
+  // Snapshots received from a leader and installed, cluster-wide.
+  int snapshots_installed() const { return snapshots_installed_; }
+  int snapshots_taken() const { return snapshots_taken_; }
 
   uint64_t now() const { return now_; }
 
  private:
   struct Disk {
     raft::HardState hard_state;
-    std::vector<pb::LogEntry> log;
+    std::optional<raft::Snapshot> snapshot;
+    std::vector<pb::LogEntry> log;  // contiguous, continuing after the snapshot
+
+    LogIndex last_index() const {
+      if (!log.empty()) return log.back().index();
+      return snapshot ? snapshot->index : 0;
+    }
   };
+  // Volatile state of a node that (re)starts from its disk.
+  void reset_state(NodeId id);
   std::unique_ptr<raft::RaftCore> make_core(NodeId id);
   void process_ready(NodeId id);
   void enqueue(const pb::RaftMessage& msg);
@@ -153,6 +171,8 @@ class SimCluster {
 
   std::map<Term, NodeId> leader_of_term_;  // for Election Safety
   std::vector<std::string> violations_;
+  int snapshots_installed_ = 0;
+  int snapshots_taken_ = 0;
 };
 
 }  // namespace ledger::sim

@@ -98,6 +98,7 @@ def main():
     c = Cluster(build_dir=args.build_dir, genesis=genesis)
     ids = sorted(c.nodes)
     c.stop()
+    c.wipe()  # a fresh cluster: no Raft state from earlier runs
     try:
         c.start()
         leader = wait_leader(c, ids, "one agreed leader")

@@ -37,4 +37,30 @@ message Account {
   bytes public_key = 2;
   uint64 balance = 3;
   uint64 next_nonce = 4;
+  repeated HistoryEntry history = 5;
+}
+
+message HistoryEntry {
+  uint64 index = 1;
+  bytes tx_id = 2;
+  string counterparty = 3;
+  uint64 amount = 4;
+  bool incoming = 5;
+}
+
+message TxIndexEntry {
+  bytes tx_id = 1;
+  uint64 index = 2;
+  uint32 status = 3;
+}
+
+// The whole ledger after applying every entry up to last_applied: the data
+// of a Raft snapshot. Unlike signing bytes, these protobuf bytes never need
+// to be identical across nodes: a snapshot file is checksummed as written,
+// and nodes compare state hashes, not snapshot bytes.
+message LedgerSnapshot {
+  string chain_id = 1;
+  uint64 last_applied = 2;
+  repeated Account accounts = 3;      // sorted by name
+  repeated TxIndexEntry tx_index = 4;  // sorted by tx_id
 }

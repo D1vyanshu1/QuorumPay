@@ -174,17 +174,24 @@ transfers from the genesis faucet account.
 
 ```
 data/node-N/
-├── meta                       # currentTerm + votedFor (atomic: tmp → fsync → rename → fsync dir)
-├── wal/000001.log ...         # [len][crc32][type][term][index][payload]
-└── snap/snap-<term>-<index>.snap
+├── meta                       # currentTerm + votedFor + CRC (atomic: tmp → fsync → rename → fsync dir)
+├── wal/00000000000000000001.log ...   # 64 MB segments of [len][crc32][type][term][index][payload]
+├── snap/snap-<index>-<term>.snap      # newest 2 kept; header + ledger state + SHA-256
+├── genesis_hash               # the genesis this log was written against
+└── node.log                   # JSON-lines event log
 ```
 
-- **Torn writes:** on startup the WAL is scanned and cut at the first record with a bad length or CRC.
-- **Group commit:** all records produced in one event-loop iteration are fsynced **once**, before any acknowledgment is sent.
-- **Recovery:** load `meta`, then the newest valid snapshot, then replay the WAL into the Raft log. The node rejoins as a
-  follower and learns `commitIndex` from the leader.
-- **Snapshots** are taken every 1000 applied entries. Old WAL segments are then deleted. A follower that
-  falls behind the compacted log receives the snapshot in 1 MB `InstallSnapshot` chunks.
+- **Torn writes:** on startup the WAL is scanned and cut at the first record that is cut short, fails its CRC, or
+  doesn't continue the log (index + 1, term not decreasing).
+- **Group commit:** all records produced in one event-loop iteration are fsynced **once**, before any acknowledgment is
+  sent (`"fsync": "batch"`; also `entry` and the unsafe `none`, for benchmarks).
+- **Recovery:** load `meta`, then the newest valid snapshot (falling back to the older one if it is damaged), then
+  replay the WAL after it into the Raft log. The node rejoins as a follower and learns `commitIndex` from the leader.
+  A node refuses to start on a different `genesis.json` than its log was written with (`tools/cluster.py wipe` resets it).
+- **Snapshots** are taken every 1000 applied entries (or `ledger-admin --node N snapshot`). Raft keeps the last 100
+  entries before the snapshot for slightly-lagging followers; WAL segments are deleted up to the *older* kept snapshot,
+  so the fallback always has its log. A follower that falls behind the compacted log receives the snapshot in 1 MB
+  `InstallSnapshot` chunks.
 
 ---
 

@@ -25,6 +25,14 @@ void RaftLog::truncate_from(LogIndex index) {
   if (index <= last_index()) entries_.resize(index - snapshot_index_ - 1);
 }
 
+void RaftLog::compact_through(LogIndex index) {
+  assert(index > snapshot_index_ && index <= last_index());
+  const Term term = term_at(index);
+  entries_.erase(entries_.begin(), entries_.begin() + static_cast<std::ptrdiff_t>(index - snapshot_index_));
+  snapshot_index_ = index;
+  snapshot_term_ = term;
+}
+
 std::vector<pb::LogEntry> RaftLog::slice(LogIndex from, size_t max) const {
   std::vector<pb::LogEntry> out;
   for (LogIndex i = from; i <= last_index() && out.size() < max; ++i) out.push_back(at(i));

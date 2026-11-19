@@ -32,6 +32,11 @@ struct RaftConfig {
   int heartbeat_interval = 5;
   // Batching: at most this many entries per AppendEntries.
   size_t max_entries_per_append = 64;
+  // compact() keeps this many entries before the snapshot index, so a
+  // follower that is only a little behind still gets plain AppendEntries.
+  LogIndex compaction_margin = 100;
+  // InstallSnapshot sends the snapshot in pieces of at most this size.
+  size_t snapshot_chunk_bytes = 1 << 20;
 
   // Seeds the election-timeout RNG. Injected so simulations are reproducible.
   uint64_t seed = 0;
@@ -55,13 +60,16 @@ struct ProposeResult {
 // virtual clock and a fake network and replay any run exactly from its seed.
 //
 // Implemented: leader election, log replication with fast backtracking,
-// the commit rule, committed entries for the host to apply, and ReadIndex.
-// Still to come: snapshots (week 5), pre-vote (week 6).
+// the commit rule, committed entries for the host to apply, ReadIndex, and
+// snapshots (compact() + InstallSnapshot). Still to come: pre-vote (week 6).
 class RaftCore {
  public:
-  // `hard_state` and `log` are what the host recovered from disk (empty on
-  // first boot). A node always starts as a follower.
-  RaftCore(RaftConfig config, HardState hard_state, std::vector<pb::LogEntry> log);
+  // `hard_state`, `log` and `snapshot` are what the host recovered from disk
+  // (all empty on first boot). With a snapshot, the log continues after it:
+  // entries it covers are ignored, and its index counts as committed and
+  // applied. A node always starts as a follower.
+  RaftCore(RaftConfig config, HardState hard_state, std::vector<pb::LogEntry> log,
+           std::optional<Snapshot> snapshot = std::nullopt);
 
   void tick();
   void step(const pb::RaftMessage& msg);
@@ -73,6 +81,13 @@ class RaftCore {
   // Ready::reads_ready or Ready::reads_failed under `request_id`. Returns
   // false at once if this node isn't the leader (the caller redirects).
   bool read_index(uint64_t request_id);
+
+  // The host has snapshotted its state machine at `index` (<= what it has
+  // applied). Raft keeps the snapshot to send to lagging followers, and
+  // discards log entries up to index - compaction_margin.
+  void compact(LogIndex index, std::string data);
+  // The latest snapshot (taken here or installed from the leader).
+  const std::optional<Snapshot>& snapshot() const { return snapshot_; }
 
   bool has_ready() const;
   // Hands over everything produced since the last call and clears it.
@@ -96,10 +111,17 @@ class RaftCore {
   void handle_request_vote_resp(const pb::RaftMessage& msg);
   void handle_append_entries(const pb::RaftMessage& msg);
   void handle_append_entries_resp(const pb::RaftMessage& msg);
+  void handle_install_snapshot(const pb::RaftMessage& msg);
+  void handle_install_snapshot_resp(const pb::RaftMessage& msg);
+  void install(Snapshot s);
+  static RaftLog initial_log(const std::optional<Snapshot>& snap, std::vector<pb::LogEntry> log);
 
   // Sends the follower the entries it is missing from progress.next on.
   // Skipped while a batch is in flight unless `force` (the heartbeat).
   void send_append(NodeId peer, bool force);
+  // The next chunk of our snapshot, for a follower that needs entries we no
+  // longer have.
+  void send_snapshot(NodeId peer, bool force);
   void broadcast_append();
   void maybe_commit();
   bool committed_in_current_term() const {
@@ -140,6 +162,9 @@ class RaftCore {
   // Until then its commit index may be behind the previous leader's, so a
   // readIndex taken from it could miss committed writes.
   std::vector<uint64_t> reads_waiting_;
+
+  std::optional<Snapshot> snapshot_;  // latest; sent to lagging followers
+  std::optional<Snapshot> incoming_;  // follower: chunks received so far
 
   // Pending output for the next ready().
   HardState persisted_;  // last HardState handed to the host

@@ -40,6 +40,11 @@ class EventLoop {
   // another fd in the same epoll set.
   void add_periodic_timer(uint32_t interval_ms, Callback cb);
 
+  // Runs `cb` once after each batch of events (everything one epoll_wait
+  // returned). Work that many events can share goes here: the node writes
+  // and fsyncs once per batch instead of once per message ("group commit").
+  void set_after_batch(Callback cb) { after_batch_ = std::move(cb); }
+
   // Blocks dispatching events until stop() is called (from a callback).
   void run();
   void stop();
@@ -59,6 +64,7 @@ class EventLoop {
   std::unordered_map<int, std::shared_ptr<Handler>> by_fd_;
   std::unordered_map<uint64_t, std::shared_ptr<Handler>> by_id_;
   std::vector<int> timer_fds_;
+  Callback after_batch_;
 };
 
 }  // namespace ledger::net

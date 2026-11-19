@@ -8,6 +8,7 @@
 //   ledger-admin --node 1 unblock-all
 //   ledger-admin --node 1 propose <text>   # test hook: append to the Raft log
 //   ledger-admin --node 1 read             # linearizable read (ReadIndex)
+//   ledger-admin --node 1 snapshot         # snapshot the ledger, compact the log
 
 #include <cstdlib>
 #include <iostream>
@@ -23,7 +24,7 @@ namespace {
 
 int usage() {
   std::cerr << "usage: ledger-admin [--config cluster.json] --node N "
-               "status | block <peer> | unblock <peer> | unblock-all | propose <text> | read\n";
+               "status | block <peer> | unblock <peer> | unblock-all | propose <text> | read | snapshot\n";
   return 2;
 }
 
@@ -51,6 +52,8 @@ int main(int argc, char** argv) {
     req.mutable_unblock_peer()->set_peer_id(std::stoul(args[1]));
   } else if (cmd == "unblock-all" && args.size() == 1) {
     req.mutable_unblock_all();
+  } else if (cmd == "snapshot" && args.size() == 1) {
+    req.mutable_take_snapshot();
   } else if (cmd == "read" && args.size() == 1) {
     req.mutable_read_req();
   } else if (cmd == "propose" && args.size() == 2) {
@@ -93,6 +96,8 @@ int main(int argc, char** argv) {
                           {"state_hash", s.state_hash()},
                           {"total_supply", s.total_supply()},
                           {"accounts", s.accounts()},
+                          {"snapshot_index", s.snapshot_index()},
+                          {"first_log_index", s.first_log_index()},
                           {"peers", nlohmann::json::array()}};
     for (const auto& p : s.peers()) {
       out["peers"].push_back({{"id", p.id()},

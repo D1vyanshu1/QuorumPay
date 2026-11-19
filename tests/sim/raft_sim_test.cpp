@@ -527,16 +527,18 @@ TEST(RaftSim, DoubleSpendUnderFailoverAppliesExactlyOnce) {
 // same nonce, and retries of the same bytes) while nodes crash and the
 // network splits. At the end: one ledger state everywhere, no money created
 // or destroyed, and no (sender, nonce) applied twice.
-TEST(RaftSim, LedgerStaysConsistentUnderRandomFaults) {
+// Random signed transfers (some reusing nonces, some resent) under random
+// crashes and partitions. Adds the number of successful transfers to *ok.
+void ledger_chaos(SimOptions opts, uint64_t seeds, size_t* ok) {
   const std::vector<std::string> names = {"alice", "bob", "carol"};
   const std::vector<char> keys = {'a', 'b', 'c'};
-  SimOptions opts = ledger_opts();
+  opts.genesis = ledger_opts().genesis;
   opts.genesis.accounts[1].balance = 100;
   opts.genesis.accounts[2].balance = 100;
   opts.drop_rate = 0.10;
   opts.duplicate_rate = 0.05;
   size_t ok_total = 0;
-  for (uint64_t seed = 1; seed <= 100; ++seed) {
+  for (uint64_t seed = 1; seed <= seeds; ++seed) {
     SimCluster c(5, seed, opts);
     std::mt19937_64 rng(seed * 31 + 7);
     std::vector<std::string> sent;
@@ -609,6 +611,118 @@ TEST(RaftSim, LedgerStaysConsistentUnderRandomFaults) {
     expect_safe(c);
     if (!c.violations().empty()) break;
   }
+  *ok += ok_total;
+}
+
+TEST(RaftSim, LedgerStaysConsistentUnderRandomFaults) {
+  size_t ok_total = 0;
+  ledger_chaos(SimOptions{}, 100, &ok_total);
   EXPECT_GT(ok_total, 500u);  // plenty of transfers really happened
   std::cout << "successful transfers across all seeds: " << ok_total << "\n";
+}
+
+// ---------------------------------------------------------------- snapshots
+
+TEST(RaftSim, FollowerFarBehindCatchesUpWithASnapshot) {
+  SimOptions opts;
+  opts.snapshot_every = 10;
+  for (uint64_t seed = 1; seed <= 200; ++seed) {
+    SimCluster c(5, seed, opts);
+    ASSERT_NE(c.run_until_leader(300), -1);
+    NodeId leader = c.leaders()[0];
+    NodeId follower = leader == 1 ? 2 : 1;
+
+    c.crash(follower);
+    for (int i = 0; i < 60; ++i) c.propose("while-down-" + std::to_string(i));
+    c.run(100);  // the others commit, snapshot and compact past it
+    ASSERT_GT(c.node(leader).log().snapshot_index(), 0u) << "seed " << seed;
+    c.restart(follower);
+    ASSERT_NE(c.run_until_converged(2000), -1) << "seed " << seed;
+    EXPECT_GE(c.snapshots_installed(), 1) << "seed " << seed;
+    expect_all_applied(c, 61, seed);
+    expect_safe(c);
+  }
+}
+
+TEST(RaftSim, WholeClusterRestartsFromSnapshots) {
+  SimOptions opts = ledger_opts();
+  opts.snapshot_every = 5;
+  for (uint64_t seed = 1; seed <= 100; ++seed) {
+    SimCluster c(5, seed, opts);
+    ASSERT_NE(c.run_until_leader(300), -1);
+    for (uint64_t n = 0; n < 12; ++n) {
+      c.propose(signed_transfer("alice", "bob", 1, n, 'a'));
+      c.run(10);
+    }
+    ASSERT_NE(c.run_until_converged(1000), -1) << "seed " << seed;
+    for (NodeId id : c.ids()) c.crash(id);
+    for (NodeId id : c.ids()) {
+      c.restart(id);
+      // Back at its snapshot right away, before hearing from anyone.
+      EXPECT_GE(c.applied_index(id), 5u) << "node " << id << ", seed " << seed;
+    }
+    ASSERT_NE(c.run_until_converged(2000), -1) << "seed " << seed;
+    NodeId any = c.stable_leader(c.ids());
+    EXPECT_EQ(c.state(any).account("bob")->balance, 12u) << "seed " << seed;
+    expect_same_ledger_everywhere(c, seed);
+    expect_safe(c);
+  }
+}
+
+TEST(RaftSim, AllInvariantsHoldWithSnapshotsUnderRandomFaults) {
+  SimOptions opts;
+  opts.snapshot_every = 7;
+  opts.drop_rate = 0.10;
+  opts.duplicate_rate = 0.05;
+  opts.max_delay = 5;
+  int installed = 0;
+  for (uint64_t seed = 1; seed <= 200; ++seed) {
+    SimCluster c(5, seed, opts);
+    std::mt19937_64 chaos(seed * 13 + 5);
+    int next_tx = 0;
+    for (int round = 0; round < 60; ++round) {
+      c.run(static_cast<int>(chaos() % 30));
+      for (int k = static_cast<int>(chaos() % 5); k > 0; --k) c.propose("tx-" + std::to_string(next_tx++));
+      const NodeId id = static_cast<NodeId>(chaos() % 5 + 1);
+      switch (chaos() % 5) {
+        case 0: {
+          int down = 0;
+          for (NodeId n : c.ids()) down += !c.is_up(n);
+          if (c.is_up(id) && down < 2) c.crash(id);
+          break;
+        }
+        case 1:
+          if (!c.is_up(id)) c.restart(id);
+          break;
+        case 2: {
+          std::vector<NodeId> ids = c.ids();
+          std::shuffle(ids.begin(), ids.end(), chaos);
+          c.partition({{ids[0], ids[1]}, {ids[2], ids[3], ids[4]}});
+          break;
+        }
+        case 3:
+          c.heal();
+          break;
+        default:
+          break;
+      }
+    }
+    c.heal();
+    for (NodeId id : c.ids())
+      if (!c.is_up(id)) c.restart(id);
+    ASSERT_NE(c.run_until_converged(3000), -1) << "no convergence, seed " << seed;
+    installed += c.snapshots_installed();
+    expect_safe(c);
+    if (!c.violations().empty()) break;
+  }
+  EXPECT_GT(installed, 20);  // the faults really did force snapshot installs
+  std::cout << "snapshots installed across all seeds: " << installed << "\n";
+}
+
+TEST(RaftSim, LedgerStaysConsistentWithSnapshotsUnderRandomFaults) {
+  SimOptions opts;
+  opts.snapshot_every = 6;
+  size_t ok_total = 0;
+  ledger_chaos(opts, 100, &ok_total);
+  EXPECT_GT(ok_total, 500u);
 }

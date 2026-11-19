@@ -25,6 +25,60 @@ StateMachine::StateMachine(const Genesis& genesis) : chain_id_(genesis.chain_id)
   }
 }
 
+std::string StateMachine::snapshot() const {
+  pb::LedgerSnapshot s;
+  s.set_chain_id(chain_id_);
+  s.set_last_applied(last_applied_);
+  for (const auto& [name, a] : accounts_.all()) {
+    pb::Account* pa = s.add_accounts();
+    pa->set_name(a.name);
+    pa->set_public_key(a.public_key);
+    pa->set_balance(a.balance);
+    pa->set_next_nonce(a.next_nonce);
+    for (const auto& h : a.history) {
+      pb::HistoryEntry* ph = pa->add_history();
+      ph->set_index(h.index);
+      ph->set_tx_id(h.tx_id);
+      ph->set_counterparty(h.counterparty);
+      ph->set_amount(h.amount);
+      ph->set_incoming(h.incoming);
+    }
+  }
+  for (const auto& [tx_id, rec] : tx_index_) {
+    pb::TxIndexEntry* pt = s.add_tx_index();
+    pt->set_tx_id(tx_id);
+    pt->set_index(rec.index);
+    pt->set_status(static_cast<uint32_t>(rec.status));
+  }
+  return s.SerializeAsString();
+}
+
+StateMachine StateMachine::restore(std::string_view data) {
+  pb::LedgerSnapshot s;
+  if (!s.ParseFromArray(data.data(), static_cast<int>(data.size()))) {
+    throw std::runtime_error("ledger snapshot: unparseable");
+  }
+  StateMachine sm(Genesis{s.chain_id(), {}});
+  sm.last_applied_ = s.last_applied();
+  for (const auto& pa : s.accounts()) {
+    if (!is_valid_account_name(pa.name()) || sm.accounts_.find(pa.name())) {
+      throw std::runtime_error("ledger snapshot: bad or duplicate account " + pa.name());
+    }
+    Account& a = sm.accounts_.create(pa.name(), pa.public_key(), pa.balance(), pa.next_nonce());
+    for (const auto& ph : pa.history()) {
+      a.history.push_back(
+          HistoryRecord{ph.index(), ph.tx_id(), ph.counterparty(), ph.amount(), ph.incoming()});
+    }
+  }
+  for (const auto& pt : s.tx_index()) {
+    if (pt.status() > static_cast<uint32_t>(TxStatus::kOverflow)) {
+      throw std::runtime_error("ledger snapshot: bad tx status");
+    }
+    sm.tx_index_[pt.tx_id()] = TxRecord{pt.index(), static_cast<TxStatus>(pt.status())};
+  }
+  return sm;
+}
+
 std::optional<ApplyResult> StateMachine::apply(const pb::LogEntry& entry) {
   if (entry.index() != last_applied_ + 1) {
     throw std::logic_error("apply out of order: index " + std::to_string(entry.index()) +

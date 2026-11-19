@@ -369,3 +369,37 @@ TEST(StateMachine, PrevalidateWithoutStateChecksOnlyShape) {
   EXPECT_EQ(l.sm.prevalidate(transfer("alice", "alice", 1, 0, key('a')), false),
             TxStatus::kMalformed);
 }
+
+// ---------------------------------------------------------------- snapshots
+
+TEST(StateMachine, SnapshotRestoresTheExactState) {
+  Ledger l;
+  l.apply(create("bob", key('b'), key('b')));
+  l.apply(transfer("alice", "bob", 30, 0, key('a')));
+  l.apply(transfer("alice", "bob", 500, 1, key('a')));  // fails, still recorded
+  const Transaction ok = transfer("faucet", "alice", 7, 0, key('f'));
+  l.apply(ok);
+
+  StateMachine r = StateMachine::restore(l.sm.snapshot());
+  EXPECT_EQ(r.state_hash(), l.sm.state_hash());
+  EXPECT_EQ(r.last_applied(), 4u);
+  EXPECT_EQ(r.chain_id(), kChain);
+  EXPECT_EQ(r.account("bob")->history.size(), 1u);
+  ASSERT_TRUE(r.tx(ok.tx_id()).has_value());
+  EXPECT_EQ(r.tx(ok.tx_id())->index, 4u);
+
+  // And it carries on exactly like the original: same next entry, same hash.
+  Ledger cont;
+  cont.sm = StateMachine::restore(l.sm.snapshot());
+  const Transaction next = transfer("bob", "alice", 5, 1, key('b'));
+  EXPECT_EQ(cont.apply(next), TxStatus::kOk);
+  EXPECT_EQ(l.apply(next), TxStatus::kOk);
+  EXPECT_EQ(cont.sm.state_hash(), l.sm.state_hash());
+  // A replay is still refused after restoring: nonces and tx_index survive.
+  EXPECT_EQ(cont.apply(ok), TxStatus::kBadNonce);
+  EXPECT_EQ(cont.sm.tx(ok.tx_id())->status, TxStatus::kOk);
+}
+
+TEST(StateMachine, RestoreRejectsGarbage) {
+  EXPECT_THROW(StateMachine::restore("\xff\xff\xff not a snapshot"), std::runtime_error);
+}

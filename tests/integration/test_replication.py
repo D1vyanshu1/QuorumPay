@@ -64,6 +64,7 @@ def main():
     ids = sorted(c.nodes)
 
     c.stop()
+    c.wipe()  # a fresh cluster: no Raft state from earlier runs
     try:
         print("1. start, propose 20 entries -> all 5 nodes apply the same log")
         c.start()
@@ -85,7 +86,7 @@ def main():
         c.kill([follower])
         propose_n(c, 30, "b")
         c.start([follower])
-        wait_converged(c, ids, "restarted follower caught up (from an empty log)")
+        wait_converged(c, ids, "restarted follower caught up (from its own WAL)")
 
         leader = agreed_leader(c, ids)
         others = [n for n in ids if n != leader]

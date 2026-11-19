@@ -1,5 +1,7 @@
 #include "sim/sim_network.h"
 
+#include <algorithm>
+
 namespace ledger::sim {
 
 SimCluster::SimCluster(int nodes, uint64_t seed, SimOptions opts)
@@ -20,10 +22,24 @@ std::unique_ptr<raft::RaftCore> SimCluster::make_core(NodeId id) {
   cfg.election_timeout_min = opts_.election_timeout_min;
   cfg.election_timeout_max = opts_.election_timeout_max;
   cfg.max_entries_per_append = 8;  // small, so catch-up takes several batches
+  cfg.compaction_margin = opts_.compaction_margin;
+  cfg.snapshot_chunk_bytes = opts_.snapshot_chunk_bytes;
   // Distinct per node and per restart, but fixed by the cluster seed.
   cfg.seed = seed_ * 1000003 + id * 7919 + static_cast<uint64_t>(restarts_);
   const Disk& d = disks_[id];
-  return std::make_unique<raft::RaftCore>(cfg, d.hard_state, d.log);
+  return std::make_unique<raft::RaftCore>(cfg, d.hard_state, d.log, d.snapshot);
+}
+
+void SimCluster::reset_state(NodeId id) {
+  const Disk& d = disks_.at(id);
+  if (d.snapshot) {
+    state_.at(id) = std::make_unique<ledger::StateMachine>(
+        ledger::StateMachine::restore(d.snapshot->data));
+    applied_index_.at(id) = d.snapshot->index;
+  } else {
+    state_.at(id) = std::make_unique<ledger::StateMachine>(opts_.genesis);
+    applied_index_.at(id) = 0;
+  }
 }
 
 std::vector<NodeId> SimCluster::ids() const {
@@ -118,17 +134,34 @@ void SimCluster::process_ready(NodeId id) {
   raft::Ready rd = core.ready();
   Disk& disk = disks_[id];
 
+  // 0. A snapshot from the leader replaces the state machine and the stored
+  //    log (the entries Raft kept after it come back in rd.entries).
+  if (rd.snapshot) {
+    const raft::Snapshot& s = *rd.snapshot;
+    disk.snapshot = s;
+    disk.log.clear();
+    ++snapshots_installed_;
+    state_.at(id) =
+        std::make_unique<ledger::StateMachine>(ledger::StateMachine::restore(s.data));
+    applied_index_.at(id) = s.index;
+    auto h = state_hash_at_.find(s.index);
+    if (h != state_hash_at_.end() && h->second != state_.at(id)->state_hash()) {
+      violation("Deterministic apply: snapshot installed on node " + std::to_string(id) +
+                " differs from the state others had at index " + std::to_string(s.index));
+    }
+  }
+
   // 1. Persist. In the real node this is a write + fsync. New entries
   //    replace whatever is stored from their first index on.
   if (rd.hard_state) disk.hard_state = *rd.hard_state;
   if (!rd.entries.empty()) {
-    const size_t first = rd.entries.front().index();
-    if (first > disk.log.size() + 1) violation("node " + std::to_string(id) + " log gap");
-    if (core.role() == raft::Role::kLeader && first <= disk.log.size()) {
+    const LogIndex first = rd.entries.front().index();
+    if (first > disk.last_index() + 1) violation("node " + std::to_string(id) + " log gap");
+    if (core.role() == raft::Role::kLeader && first <= disk.last_index()) {
       violation("Leader Append-Only: leader " + std::to_string(id) + " overwrote index " +
                 std::to_string(first));
     }
-    if (disk.log.size() >= first) disk.log.resize(first - 1);
+    while (!disk.log.empty() && disk.log.back().index() >= first) disk.log.pop_back();
     for (auto& e : rd.entries) disk.log.push_back(std::move(e));
   }
 
@@ -157,6 +190,21 @@ void SimCluster::process_ready(NodeId id) {
     if (!first && h->second != sm.state_hash()) {
       violation("Deterministic apply: node " + std::to_string(id) + " has a different state hash at index " +
                 std::to_string(e.index()));
+    }
+  }
+
+  // Take a snapshot now and then, like the node does: Raft compacts its log,
+  // and the disk drops the entries the snapshot covers.
+  if (opts_.snapshot_every > 0) {
+    const LogIndex applied = applied_index_.at(id);
+    const LogIndex last_snap = disk.snapshot ? disk.snapshot->index : 0;
+    if (applied >= last_snap + opts_.snapshot_every) {
+      core.compact(applied, state_.at(id)->snapshot());
+      disk.snapshot = core.snapshot();
+      disk.log.erase(std::remove_if(disk.log.begin(), disk.log.end(),
+                                    [&](const pb::LogEntry& e) { return e.index() <= applied; }),
+                     disk.log.end());
+      ++snapshots_taken_;
     }
   }
 
@@ -193,8 +241,7 @@ void SimCluster::crash(NodeId id) {
   for (auto& [_, o] : reads_) {
     if (o.node == id && !o.done) o.failed = true;  // its client sees the connection drop
   }
-  applied_index_.at(id) = 0;  // the state machine lives in memory
-  state_.at(id) = std::make_unique<ledger::StateMachine>(opts_.genesis);
+  reset_state(id);  // the state machine lives in memory: back to the snapshot
 }
 
 void SimCluster::restart(NodeId id) {
@@ -270,6 +317,9 @@ void SimCluster::check_invariants(NodeId id) {
   // entry anyone has applied (so it was committed) must be in its log.
   if (inserted) {
     for (const auto& [index, e] : applied_history_) {
+      // Entries before the log's start are in the leader's snapshot, which
+      // only ever holds committed state.
+      if (index < core.log().snapshot_index()) continue;
       if (index > core.log().last_index() || core.log().term_at(index) != e.term()) {
         violation("Leader Completeness: new leader " + std::to_string(id) + " (term " +
                   std::to_string(core.term()) + ") lacks committed index " +
@@ -284,28 +334,33 @@ void SimCluster::check_invariants(NodeId id) {
 // if two logs have an entry with the same index and term, they are identical
 // up to and including that index.
 void SimCluster::check_log_matching() {
+  // By index, over the range both disks still hold (snapshots cut the front).
   for (auto a = disks_.begin(); a != disks_.end(); ++a) {
     for (auto b = std::next(a); b != disks_.end(); ++b) {
       const auto& la = a->second.log;
       const auto& lb = b->second.log;
-      const size_t n = std::min(la.size(), lb.size());
-      size_t first_diff = n;
-      for (size_t i = 0; i < n; ++i) {
-        if (la[i].term() != lb[i].term()) {
+      if (la.empty() || lb.empty()) continue;
+      const LogIndex lo = std::max(la.front().index(), lb.front().index());
+      const LogIndex hi = std::min(la.back().index(), lb.back().index());
+      auto at = [](const std::vector<pb::LogEntry>& l, LogIndex i) -> const pb::LogEntry& {
+        return l[i - l.front().index()];
+      };
+      LogIndex first_diff = hi + 1;
+      for (LogIndex i = lo; i <= hi; ++i) {
+        if (at(la, i).term() != at(lb, i).term()) {
           first_diff = i;
           break;
         }
-        if (la[i].data() != lb[i].data()) {
+        if (at(la, i).data() != at(lb, i).data()) {
           violation("Log Matching: nodes " + std::to_string(a->first) + " and " +
-                    std::to_string(b->first) + " differ in data at index " +
-                    std::to_string(i + 1));
+                    std::to_string(b->first) + " differ in data at index " + std::to_string(i));
           return;
         }
       }
-      for (size_t i = first_diff; i < n; ++i) {
-        if (la[i].term() == lb[i].term()) {
+      for (LogIndex i = first_diff; i <= hi; ++i) {
+        if (at(la, i).term() == at(lb, i).term()) {
           violation("Log Matching: nodes " + std::to_string(a->first) + " and " +
-                    std::to_string(b->first) + " agree at index " + std::to_string(i + 1) +
+                    std::to_string(b->first) + " agree at index " + std::to_string(i) +
                     " but differ before it");
           return;
         }

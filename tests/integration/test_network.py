@@ -47,6 +47,7 @@ def main():
     full = {n: set(ids) - {n} for n in ids}
 
     c.stop()
+    c.wipe()  # a fresh cluster: no Raft state from earlier runs
     try:
         print("1. start 5 nodes -> full mesh")
         c.start()

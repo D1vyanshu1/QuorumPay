@@ -10,21 +10,44 @@
     tools/cluster.py propose hello      # append to the Raft log via the leader
     tools/cluster.py read [node]        # linearizable read (default: the leader)
     tools/cluster.py stop               # SIGTERM all
+    tools/cluster.py wipe               # delete stopped nodes' Raft state (or: wipe 3)
 
 Each node's log goes to data/node-N/node.log; its pid to data/node-N/pid.
 Run from the repo root. Binaries are taken from build/ (override: --build-dir).
 Nodes load config/genesis.json unless --genesis names another file.
+Each node keeps its Raft state (meta, wal/) in its data dir across restarts;
+`wipe` deletes it for a fresh cluster (needed after changing the genesis).
 """
 
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _alive(pid):
+    """True if `pid` is a running process. A dead child of ours stays a zombie
+    (and os.kill(pid, 0) still succeeds) until it is reaped, so reap it."""
+    try:
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return False  # it was our child, it had exited, now it's reaped
+    except ChildProcessError:
+        pass  # not our child (started by another cluster.py run)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
 
 
 class Cluster:
@@ -44,10 +67,9 @@ class Cluster:
         try:
             with open(os.path.join(self._data_dir(nid), "pid")) as f:
                 pid = int(f.read().strip())
-            os.kill(pid, 0)  # raises if not running
-            return pid
-        except (FileNotFoundError, ValueError, ProcessLookupError):
+        except (FileNotFoundError, ValueError):
             return None
+        return pid if _alive(pid) else None
 
     def is_running(self, nid):
         return self._pid(nid) is not None
@@ -79,11 +101,9 @@ class Cluster:
                 continue
             os.kill(pid, sig)
             for _ in range(100):  # wait up to 2s for it to exit
-                try:
-                    os.kill(pid, 0)
-                    time.sleep(0.02)
-                except ProcessLookupError:
+                if not _alive(pid):
                     break
+                time.sleep(0.02)
             print(f"node {nid} {verb}")
 
     def stop(self, ids=None):
@@ -91,6 +111,20 @@ class Cluster:
 
     def kill(self, ids=None):
         self._signal(ids, signal.SIGKILL, "killed")
+
+    def wipe(self, ids=None):
+        """Deletes the Raft state of stopped nodes (keeps node.log)."""
+        for nid in ids or self.nodes:
+            if self.is_running(nid):
+                raise RuntimeError(f"node {nid} is running: stop it before wiping")
+            d = self._data_dir(nid)
+            if not os.path.isdir(d):
+                continue
+            for name in os.listdir(d):
+                if name == "node.log":
+                    continue
+                p = os.path.join(d, name)
+                shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
 
     def restart(self, ids):
         self.kill(ids)
@@ -194,7 +228,7 @@ def main():
     ap.add_argument("--genesis", help="genesis file for the nodes (default config/genesis.json)")
     ap.add_argument("command",
                     choices=["start", "stop", "kill", "restart", "status", "partition", "heal",
-                             "propose", "read"])
+                             "propose", "read", "wipe"])
     ap.add_argument("args", nargs="*")
     a = ap.parse_args()
 
@@ -205,6 +239,8 @@ def main():
         c.stop(parse_ids(a.args))
     elif a.command == "kill":
         c.kill(parse_ids(a.args))
+    elif a.command == "wipe":
+        c.wipe(parse_ids(a.args))
     elif a.command == "restart":
         c.restart(parse_ids(a.args))
     elif a.command == "status":

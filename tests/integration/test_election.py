@@ -58,6 +58,7 @@ def main():
     ids = sorted(c.nodes)
 
     c.stop()
+    c.wipe()  # a fresh cluster: no Raft state from earlier runs
     try:
         print("1. start 5 nodes -> exactly one leader, everyone agrees")
         c.start()

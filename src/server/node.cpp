@@ -12,6 +12,7 @@
 #include "common/clock.h"
 #include "common/hex.h"
 #include "common/logger.h"
+#include "storage/file_util.h"
 
 namespace ledger {
 
@@ -19,16 +20,101 @@ Node::Node(ClusterConfig config, NodeId self, const Genesis& genesis)
     : config_(std::move(config)),
       self_(self),
       peers_(loop_, config_, self_, faults_),
-      // Nothing on disk yet (week 5 loads HardState + log here). Note raft_ is
-      // declared before hard_state_/log_, so it must not read them here.
-      raft_(make_raft_config(), raft::HardState{}, {}),
-      ledger_(genesis),
+      data_dir_(data_dir_of(config_, self_)),
+      meta_(data_dir_),
+      wal_(data_dir_ + "/wal", fsync_mode_of(config_)),
+      snaps_(data_dir_ + "/snap"),
+      boot_snapshot_(load_snapshot()),
+      // What the last run of this node promised: its term, its vote, its log.
+      raft_(make_raft_config(), load_hard_state(), recover_log(), boot_snapshot_),
+      ledger_(initial_ledger(genesis, boot_snapshot_)),
       service_(raft_, ledger_,
                [this](uint64_t cid, const pb::Envelope& m) { reply_to_client(cid, m); }) {
-  if (config_.find(self_) == nullptr) {
-    throw std::runtime_error("node id " + std::to_string(self_) + " not in cluster config");
-  }
+  check_genesis(genesis);
+  if (boot_snapshot_) last_snapshot_index_ = boot_snapshot_->index;
+  boot_snapshot_.reset();  // RaftCore and the ledger have their copies
   for (NodeId id : peers_.peer_ids()) health_[id] = PeerHealth{};
+}
+
+std::optional<raft::Snapshot> Node::load_snapshot() {
+  size_t skipped = 0;
+  auto f = snaps_.load_latest(&skipped);
+  if (skipped > 0) log_warn("snapshot_damaged", {{"skipped", skipped}});
+  if (!f) return std::nullopt;
+  return raft::Snapshot{f->index, f->term, std::move(f->data)};
+}
+
+ledger::StateMachine Node::initial_ledger(const Genesis& genesis,
+                                          const std::optional<raft::Snapshot>& snap) {
+  if (!snap) return ledger::StateMachine(genesis);
+  ledger::StateMachine sm = ledger::StateMachine::restore(snap->data);
+  if (sm.chain_id() != genesis.chain_id || sm.last_applied() != snap->index) {
+    throw std::runtime_error("snapshot at " + std::to_string(snap->index) +
+                             " doesn't belong to this genesis/log");
+  }
+  return sm;
+}
+
+std::string Node::data_dir_of(const ClusterConfig& config, NodeId self) {
+  const NodeConfig* me = config.find(self);
+  if (me == nullptr) {
+    throw std::runtime_error("node id " + std::to_string(self) + " not in cluster config");
+  }
+  storage::make_dirs(me->data_dir);
+  return me->data_dir;
+}
+
+storage::FsyncMode Node::fsync_mode_of(const ClusterConfig& config) {
+  storage::FsyncMode mode;
+  if (!storage::parse_fsync_mode(config.raft.fsync, &mode)) {
+    throw std::runtime_error("config: fsync must be entry, batch or none, not " +
+                             config.raft.fsync);
+  }
+  return mode;
+}
+
+raft::HardState Node::load_hard_state() const {
+  storage::Meta m = meta_.load();
+  return raft::HardState{m.term, m.voted_for};
+}
+
+std::vector<pb::LogEntry> Node::recover_log() {
+  storage::Wal::Recovery r = wal_.take_recovery();
+  storage::Meta m = meta_.load();
+  // The WAL must continue the snapshot (or genesis) without a hole, or the
+  // entries in between are gone and this node can't rebuild its state.
+  const LogIndex base = boot_snapshot_ ? boot_snapshot_->index : 0;
+  if (!r.entries.empty() && r.entries.front().index() > base + 1) {
+    throw std::runtime_error("WAL starts at " + std::to_string(r.entries.front().index()) +
+                             " but the newest usable snapshot ends at " + std::to_string(base) +
+                             "; wipe this node and let it catch up from the leader");
+  }
+  log_info("recovered", {{"term", m.term},
+                         {"snapshot_index", base},
+                         {"voted_for", m.voted_for},
+                         {"entries", r.entries.size()},
+                         {"first_index", r.entries.empty() ? 0 : r.entries.front().index()},
+                         {"last_index", r.entries.empty() ? 0 : r.entries.back().index()},
+                         {"truncated_bytes", r.truncated_bytes},
+                         {"deleted_segments", r.deleted_segments},
+                         {"fsync", config_.raft.fsync}});
+  return std::move(r.entries);
+}
+
+// The log only makes sense on top of the genesis it was written against.
+// Restarting with a different genesis.json would replay old transactions
+// against other accounts and quietly produce a different ledger, so refuse.
+// (The ledger's state hash before any entry is a fingerprint of the genesis.)
+void Node::check_genesis(const Genesis& genesis) {
+  const std::string path = data_dir_ + "/genesis_hash";
+  const std::string mine = to_hex(ledger::StateMachine(genesis).state_hash());
+  auto stored = storage::read_file(path);
+  if (!stored) {
+    storage::write_file_atomic(path, mine + "\n");
+  } else if (*stored != mine + "\n") {
+    throw std::runtime_error(data_dir_ + " was written with a different genesis; " +
+                             "wipe it (tools/cluster.py wipe) or use the original genesis");
+  }
 }
 
 raft::RaftConfig Node::make_raft_config() const {
@@ -77,6 +163,9 @@ void Node::run() {
       [this](int fd, std::string remote) { on_client_accept(fd, std::move(remote)); });
 
   loop_.add_periodic_timer(config_.raft.tick_ms, [this] { on_tick(); });
+  // All the Raft work of one batch of events is persisted, sent and applied
+  // together: one fsync per batch, however many messages arrived.
+  loop_.set_after_batch([this] { process_ready(); });
 
   log_info("node_started", {{"peer_port", me->peer_port},
                             {"client_port", me->client_port},
@@ -96,12 +185,11 @@ void Node::on_tick() {
   update_reachability(now);
 
   raft_.tick();
-  process_ready();
 }
 
 // The host half of the Ready contract: persist, then send, then apply.
-// Persisting is in memory for now; week 5 makes it a write + fsync, and
-// because the order is already right here nothing else has to change.
+// Persisting means durable: the vote and the entries are fsynced before any
+// message that depends on them (a vote, an ack) can leave this node.
 void Node::process_ready() {
   if (!raft_.has_ready()) {
     service_.after_ready();
@@ -109,12 +197,13 @@ void Node::process_ready() {
   }
   raft::Ready rd = raft_.ready();
 
-  if (rd.hard_state) hard_state_ = *rd.hard_state;
-  if (!rd.entries.empty()) {
-    // New entries replace anything stored from their first index on.
-    log_.resize(std::min<size_t>(log_.size(), rd.entries.front().index() - 1));
-    for (auto& e : rd.entries) log_.push_back(std::move(e));
-  }
+  // 0. A snapshot from the leader (we were too far behind for log entries).
+  if (rd.snapshot) install_snapshot(*rd.snapshot);
+
+  if (rd.hard_state) meta_.save(storage::Meta{rd.hard_state->term, rd.hard_state->voted_for});
+  // New entries replace anything stored from their first index on.
+  if (!rd.entries.empty()) wal_.write(rd.entries);
+  wal_.sync();  // one fsync for this whole batch (a no-op if nothing was written)
 
   for (auto& m : rd.messages) {
     NodeId to = m.to();
@@ -126,6 +215,10 @@ void Node::process_ready() {
   for (const auto& e : rd.committed_entries) {
     apply(e);
     service_.on_applied(e);  // answers the client that submitted it, if any
+  }
+  if (config_.raft.snapshot_every > 0 &&
+      ledger_.last_applied() >= last_snapshot_index_ + config_.raft.snapshot_every) {
+    take_snapshot();
   }
 
   // Reads go last: the entries above bring the ledger up to (at least)
@@ -145,6 +238,36 @@ void Node::process_ready() {
                             {"leader", logged_leader_},
                             {"last_log_index", raft_.log().last_index()}});
   }
+}
+
+void Node::take_snapshot() {
+  const LogIndex index = ledger_.last_applied();
+  if (index <= last_snapshot_index_) return;
+  raft_.compact(index, ledger_.snapshot());
+  const raft::Snapshot& s = *raft_.snapshot();
+  // Durable first; only then may the log entries it covers go.
+  snaps_.save(storage::SnapshotFile{s.index, s.term, s.data});
+  // Compact the WAL only up to the OLDER of the kept snapshots: if the newest
+  // file turns out to be damaged, recovery falls back to the older one and
+  // still needs the entries after it.
+  auto kept = snaps_.list();
+  if (kept.size() >= 2) wal_.compact_through(kept[1]);
+  last_snapshot_index_ = index;
+  log_info("snapshot_taken", {{"index", s.index},
+                              {"term", s.term},
+                              {"bytes", s.data.size()},
+                              {"log_first_index", raft_.log().snapshot_index() + 1},
+                              {"wal_first_index", wal_.first_index()}});
+}
+
+void Node::install_snapshot(const raft::Snapshot& s) {
+  snaps_.save(storage::SnapshotFile{s.index, s.term, s.data});
+  // The stored log is replaced: the entries Raft kept after the snapshot (if
+  // any) arrive in this same Ready's entries and are written next.
+  wal_.reset();
+  ledger_ = ledger::StateMachine::restore(s.data);
+  last_snapshot_index_ = s.index;
+  log_info("snapshot_installed", {{"index", s.index}, {"term", s.term}, {"bytes", s.data.size()}});
 }
 
 void Node::apply(const pb::LogEntry& e) {
@@ -207,8 +330,7 @@ void Node::on_peer_message(NodeId from, const pb::Envelope& msg, net::Connection
         log_warn("raft_misrouted", {{"peer", from}, {"claims_from", msg.raft().from()}});
         break;
       }
-      raft_.step(msg.raft());
-      process_ready();
+      raft_.step(msg.raft());  // persisted + answered at the end of the batch
       break;
     default:
       log_warn("unexpected_peer_message", {{"peer", from}, {"type", msg.msg_case()}});
@@ -231,10 +353,7 @@ void Node::on_client_frame(net::Connection& conn, std::string_view payload) {
     conn.close("unparseable frame");
     return;
   }
-  if (service_.handle(conn.id(), req)) {
-    process_ready();  // replicate a proposal / start a read round now, not next tick
-    return;
-  }
+  if (service_.handle(conn.id(), req)) return;  // proposal/read goes out at the end of the batch
   std::string bytes;
   handle_admin(req).SerializeToString(&bytes);
   conn.send_frame(bytes);
@@ -257,7 +376,6 @@ pb::Envelope Node::handle_admin(const pb::Envelope& req) {
         pr->set_leader_hint(raft_.leader());
         break;
       }
-      process_ready();  // start replicating now, not on the next tick
       pr->set_accepted(true);
       pr->set_index(r->index);
       pr->set_term(r->term);
@@ -275,6 +393,10 @@ pb::Envelope Node::handle_admin(const pb::Envelope& req) {
     case pb::Envelope::kUnblockPeer:
       faults_.unblock(req.unblock_peer().peer_id());
       log_info("fault_unblock", {{"peer", req.unblock_peer().peer_id()}});
+      ok();
+      break;
+    case pb::Envelope::kTakeSnapshot:
+      take_snapshot();
       ok();
       break;
     case pb::Envelope::kUnblockAll:
@@ -300,6 +422,8 @@ pb::StatusResp Node::build_status() const {
   s.set_state_hash(to_hex(ledger_.state_hash()));
   s.set_total_supply(ledger_.total_supply());
   s.set_accounts(static_cast<uint32_t>(ledger_.accounts().all().size()));
+  s.set_snapshot_index(raft_.snapshot() ? raft_.snapshot()->index : 0);
+  s.set_first_log_index(raft_.log().snapshot_index() + 1);
   uint64_t now = now_ms();
   for (const auto& [id, h] : health_) {
     pb::PeerStatus* p = s.add_peers();

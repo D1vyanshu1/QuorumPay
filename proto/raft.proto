@@ -51,6 +51,27 @@ message AppendEntriesResp {
   uint64 read_ctx = 5;        // echoed from the request
 }
 
+// Sent by the leader instead of AppendEntries when a follower needs entries
+// the leader has already compacted away: the leader's latest snapshot, in
+// chunks. The snapshot covers every entry up to last_index (whose term is
+// last_term); `data` is opaque to Raft (the serialized ledger state).
+message InstallSnapshot {
+  uint64 last_index = 1;
+  uint64 last_term = 2;
+  uint64 offset = 3;  // where this chunk starts in the snapshot's data
+  bytes data = 4;
+  bool done = 5;      // the last chunk
+}
+
+// bytes_received tells the leader where to continue (it restarts from 0 if
+// the follower lost track). done = installed, or not needed because the
+// follower's log already covers last_index.
+message InstallSnapshotResp {
+  uint64 last_index = 1;
+  uint64 bytes_received = 2;
+  bool done = 3;
+}
+
 // Every Raft message carries the sender's current term. Any node that sees a
 // higher term than its own immediately steps down to follower at that term.
 message RaftMessage {
@@ -62,5 +83,7 @@ message RaftMessage {
     RequestVoteResp request_vote_resp = 11;
     AppendEntries append_entries = 12;
     AppendEntriesResp append_entries_resp = 13;
+    InstallSnapshot install_snapshot = 14;
+    InstallSnapshotResp install_snapshot_resp = 15;
   }
 }

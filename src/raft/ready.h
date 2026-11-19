@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "common/types.h"
@@ -26,10 +27,21 @@ struct HardState {
   bool operator!=(const HardState& o) const { return !(*this == o); }
 };
 
+// The state machine's state after applying every entry up to `index` (whose
+// term is `term`). Raft never looks inside `data`; it only stores it and
+// ships it to followers that are too far behind for log entries.
+struct Snapshot {
+  LogIndex index = 0;
+  Term term = 0;
+  std::string data;
+};
+
 // Everything RaftCore wants done since the last ready() call. RaftCore never
 // does I/O itself; the host (the real node, or the simulator) must handle a
 // Ready in this order:
 //
+//   0. if `snapshot` is set (received from the leader): store it durably and
+//      replace the state machine with it
 //   1. persist hard_state and entries (fsync)
 //   2. send messages
 //   3. apply committed_entries to the state machine, in order
@@ -39,6 +51,11 @@ struct HardState {
 // Persisting first is what makes a vote or an ack a promise: once another node
 // has seen it, it survives a crash of this node.
 struct Ready {
+  // A snapshot received from the leader, to install. committed_entries then
+  // continue from snapshot->index + 1. Stored log entries up to its index are
+  // no longer needed; later ones (if any) are still valid.
+  std::optional<Snapshot> snapshot;
+
   std::optional<HardState> hard_state;  // set only when it changed
 
   // Log entries to store, contiguous and ascending. They REPLACE anything the
@@ -59,7 +76,7 @@ struct Ready {
   std::vector<uint64_t> reads_failed;
 
   bool empty() const {
-    return !hard_state && entries.empty() && messages.empty() && committed_entries.empty() &&
+    return !snapshot && !hard_state && entries.empty() && messages.empty() && committed_entries.empty() &&
            reads_ready.empty() && reads_failed.empty();
   }
 };

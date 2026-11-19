@@ -126,6 +126,7 @@ void EventLoop::run() {
         h->on_writable();
       }
     }
+    if (after_batch_) after_batch_();
   }
 }
 

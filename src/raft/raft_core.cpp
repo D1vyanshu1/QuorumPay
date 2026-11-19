@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <functional>
 
 namespace ledger::raft {
@@ -18,14 +19,33 @@ const char* role_name(Role r) {
   return "?";
 }
 
-RaftCore::RaftCore(RaftConfig config, HardState hard_state, std::vector<pb::LogEntry> log)
+RaftCore::RaftCore(RaftConfig config, HardState hard_state, std::vector<pb::LogEntry> log,
+                   std::optional<Snapshot> snapshot)
     : config_(std::move(config)),
       rng_(config_.seed),
       term_(hard_state.term),
       voted_for_(hard_state.voted_for),
-      log_(std::move(log)),
+      log_(initial_log(snapshot, std::move(log))),
+      snapshot_(std::move(snapshot)),
       persisted_(hard_state) {
+  if (snapshot_) {
+    // A snapshot only ever holds committed, applied state.
+    commit_index_ = snapshot_->index;
+    applied_ = snapshot_->index;
+  }
   reset_election_timer();
+}
+
+RaftLog RaftCore::initial_log(const std::optional<Snapshot>& snap, std::vector<pb::LogEntry> log) {
+  if (!snap) return RaftLog(std::move(log));
+  // Keep only the entries that continue right after the snapshot.
+  std::vector<pb::LogEntry> after;
+  for (auto& e : log) {
+    if (e.index() <= snap->index) continue;
+    if (e.index() != snap->index + after.size() + 1) break;
+    after.push_back(std::move(e));
+  }
+  return RaftLog(snap->index, snap->term, std::move(after));
 }
 
 // ---------------------------------------------------------------- inputs
@@ -49,7 +69,7 @@ void RaftCore::step(const pb::RaftMessage& msg) {
   // Step down before handling the message. An AppendEntries can only come
   // from the leader of that term, so we learn the leader too.
   if (msg.term() > term_) {
-    NodeId leader = msg.has_append_entries() ? msg.from() : kNoNode;
+    NodeId leader = msg.has_append_entries() || msg.has_install_snapshot() ? msg.from() : kNoNode;
     become_follower(msg.term(), leader);
   }
 
@@ -65,6 +85,12 @@ void RaftCore::step(const pb::RaftMessage& msg) {
       break;
     case pb::RaftMessage::kAppendEntriesResp:
       handle_append_entries_resp(msg);
+      break;
+    case pb::RaftMessage::kInstallSnapshot:
+      handle_install_snapshot(msg);
+      break;
+    case pb::RaftMessage::kInstallSnapshotResp:
+      handle_install_snapshot_resp(msg);
       break;
     case pb::RaftMessage::BODY_NOT_SET:
       break;
@@ -211,6 +237,15 @@ void RaftCore::handle_append_entries(const pb::RaftMessage& msg) {
   const auto& ae = msg.append_entries();
   const LogIndex prev = ae.prev_log_index();
 
+  if (prev < log_.snapshot_index()) {
+    // Entries our snapshot already covers. Those are committed, so they
+    // match the leader's; say how far we agree and let it send the rest.
+    resp->set_success(true);
+    resp->set_match_index(log_.snapshot_index());
+    send(msg.from(), std::move(reply));
+    return;
+  }
+
   // Consistency check: we must hold the entry just before the new ones, with
   // the same term. By induction (Log Matching), everything before it then
   // matches the leader too.
@@ -305,6 +340,13 @@ void RaftCore::handle_append_entries_resp(const pb::RaftMessage& msg) {
 
 void RaftCore::send_append(NodeId peer, bool force) {
   Progress& pr = progress_.at(peer);
+  if (pr.next <= log_.snapshot_index()) {
+    // The entry before `next` was compacted away: we can't prove the logs
+    // match there, and we no longer have the entries. Send the snapshot.
+    send_snapshot(peer, force);
+    return;
+  }
+  pr.snapshotting = false;
   if (pr.in_flight && !force) return;
 
   const LogIndex prev = pr.next - 1;
@@ -319,6 +361,121 @@ void RaftCore::send_append(NodeId peer, bool force) {
   ae->set_read_ctx(reads_.last_ctx());
   pr.in_flight = ae->entries_size() > 0;
   send(peer, std::move(m));
+}
+
+void RaftCore::send_snapshot(NodeId peer, bool force) {
+  Progress& pr = progress_.at(peer);
+  assert(snapshot_ && "log compacted without a snapshot");
+  if (!pr.snapshotting || pr.snap_index != snapshot_->index) {
+    // Start (or restart with a newer snapshot) from the beginning.
+    pr.snapshotting = true;
+    pr.snap_index = snapshot_->index;
+    pr.snap_offset = 0;
+  } else if (pr.in_flight && !force) {
+    return;  // one chunk in flight at a time; the heartbeat resends a lost one
+  }
+  const std::string& data = snapshot_->data;
+  const uint64_t off = std::min<uint64_t>(pr.snap_offset, data.size());
+  const size_t n = std::min<uint64_t>(config_.snapshot_chunk_bytes, data.size() - off);
+
+  pb::RaftMessage m;
+  auto* is = m.mutable_install_snapshot();
+  is->set_last_index(snapshot_->index);
+  is->set_last_term(snapshot_->term);
+  is->set_offset(off);
+  is->set_data(data.substr(off, n));
+  is->set_done(off + n == data.size());
+  pr.in_flight = true;
+  send(peer, std::move(m));
+}
+
+void RaftCore::handle_install_snapshot(const pb::RaftMessage& msg) {
+  const auto& is = msg.install_snapshot();
+  pb::RaftMessage reply;
+  auto* resp = reply.mutable_install_snapshot_resp();
+  resp->set_last_index(is.last_index());
+
+  if (msg.term() < term_) {  // a deposed leader; our term makes it step down
+    send(msg.from(), std::move(reply));
+    return;
+  }
+  become_follower(msg.term(), msg.from());
+
+  if (is.last_index() <= commit_index_) {
+    // We already have everything it covers (committed entries match).
+    incoming_.reset();
+    resp->set_done(true);
+    send(msg.from(), std::move(reply));
+    return;
+  }
+  if (is.offset() == 0) {
+    incoming_ = Snapshot{is.last_index(), is.last_term(), ""};
+  } else if (!incoming_ || incoming_->index != is.last_index() ||
+             incoming_->data.size() != is.offset()) {
+    // A chunk that doesn't continue what we have (an earlier one was lost,
+    // or this is another snapshot): tell the leader where to resume.
+    bool same = incoming_ && incoming_->index == is.last_index();
+    resp->set_bytes_received(same ? incoming_->data.size() : 0);
+    send(msg.from(), std::move(reply));
+    return;
+  }
+  incoming_->data += is.data();
+  resp->set_bytes_received(incoming_->data.size());
+  if (is.done()) {
+    install(std::move(*incoming_));
+    incoming_.reset();
+    resp->set_done(true);
+  }
+  send(msg.from(), std::move(reply));
+}
+
+void RaftCore::install(Snapshot s) {
+  // §7: if our log has the snapshot's last entry (same index and term), the
+  // entries after it may still be good: keep them. Otherwise our log is
+  // stale or conflicting, and the snapshot replaces all of it.
+  std::vector<pb::LogEntry> keep;
+  if (s.index <= log_.last_index() && s.index >= log_.snapshot_index() &&
+      log_.term_at(s.index) == s.term) {
+    keep = log_.slice(s.index + 1, SIZE_MAX);
+  }
+  log_ = RaftLog(s.index, s.term, keep);
+  commit_index_ = std::max(commit_index_, s.index);
+  applied_ = s.index;  // the host applies it by installing the snapshot
+  // The host replaces its stored log with the snapshot + these entries.
+  pending_.entries = std::move(keep);
+  pending_.snapshot = s;
+  snapshot_ = std::move(s);
+}
+
+void RaftCore::handle_install_snapshot_resp(const pb::RaftMessage& msg) {
+  if (role_ != Role::kLeader || msg.term() != term_) return;
+  auto it = progress_.find(msg.from());
+  if (it == progress_.end()) return;
+  Progress& pr = it->second;
+  const auto& resp = msg.install_snapshot_resp();
+  pr.in_flight = false;
+
+  if (resp.done()) {
+    pr.snapshotting = false;
+    if (resp.last_index() > pr.match) {
+      pr.match = resp.last_index();
+      maybe_commit();
+    }
+    pr.next = std::max(pr.next, pr.match + 1);
+    if (pr.next <= log_.last_index()) send_append(msg.from(), /*force=*/false);
+    return;
+  }
+  if (!pr.snapshotting || resp.last_index() != pr.snap_index) return;  // about an older one
+  pr.snap_offset = resp.bytes_received();
+  send_snapshot(msg.from(), /*force=*/false);
+}
+
+void RaftCore::compact(LogIndex index, std::string data) {
+  assert(index <= applied_ && "can't snapshot entries the host hasn't applied");
+  if (index == 0 || (snapshot_ && index <= snapshot_->index)) return;
+  snapshot_ = Snapshot{index, log_.term_at(index), std::move(data)};
+  const LogIndex through = index > config_.compaction_margin ? index - config_.compaction_margin : 0;
+  if (through > log_.snapshot_index()) log_.compact_through(through);
 }
 
 // Heartbeat: every follower gets an AppendEntries, with entries if it is
@@ -385,7 +542,8 @@ void RaftCore::reset_election_timer() {
 // ---------------------------------------------------------------- output
 
 bool RaftCore::has_ready() const {
-  return HardState{term_, voted_for_} != persisted_ || !pending_.entries.empty() ||
+  return HardState{term_, voted_for_} != persisted_ || pending_.snapshot ||
+         !pending_.entries.empty() ||
          !pending_.messages.empty() || commit_index_ > applied_ ||
          !pending_.reads_ready.empty() || !pending_.reads_failed.empty();
 }

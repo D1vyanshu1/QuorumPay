@@ -48,6 +48,13 @@ class StateMachine {
   // breaks a ledger rule (an invalid account name).
   explicit StateMachine(const Genesis& genesis);
 
+  // The whole state as bytes (pb::LedgerSnapshot): the data of a Raft
+  // snapshot taken at last_applied().
+  std::string snapshot() const;
+  // The state machine a snapshot() was taken of. Throws std::runtime_error if
+  // the bytes aren't a valid snapshot.
+  static StateMachine restore(std::string_view data);
+
   // Applies the committed entry at last_applied() + 1 (anything else is a
   // bug in the caller and throws std::logic_error). Returns nullopt for a
   // Raft no-op; otherwise the transaction's id and status. Any bytes at all

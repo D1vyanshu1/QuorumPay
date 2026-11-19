@@ -6,3 +6,7 @@ results/
 __pycache__/
 compile_commands.json
 context.md
+
+progress.md
+to_study.txt
+project_details.md

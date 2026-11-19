@@ -18,6 +18,9 @@
 #include "net/peer_manager.h"
 #include "raft/raft_core.h"
 #include "server/client_service.h"
+#include "storage/meta_store.h"
+#include "storage/snapshot_store.h"
+#include "storage/wal.h"
 
 namespace ledger {
 
@@ -26,6 +29,14 @@ namespace ledger {
 //   timer tick ──▶ raft_.tick() ─┐
 //   Raft message ─▶ raft_.step() ─┼─▶ process_ready(): persist, send, apply,
 //   client request ─▶ service_ ───┘     then tell service_ (replies, reads)
+//
+// process_ready() runs once per event-loop batch, so everything that arrived
+// together is persisted with ONE fsync before any reply leaves (group commit).
+// Raft's term/vote live in meta_, its log in wal_, ledger snapshots in snaps_
+// (all under data_dir from cluster.json). On startup the node loads the newest
+// snapshot and replays the WAL after it, so a crashed node keeps every
+// promise it made. Every snapshot_every applied entries it snapshots the
+// ledger and compacts the log.
 //
 // Committed entries are applied to the ledger state machine, built from the
 // same genesis on every node; `status` shows its state hash so you can see
@@ -53,6 +64,18 @@ class Node {
   };
 
   raft::RaftConfig make_raft_config() const;
+  static std::string data_dir_of(const ClusterConfig& config, NodeId self);
+  static storage::FsyncMode fsync_mode_of(const ClusterConfig& config);
+  raft::HardState load_hard_state() const;
+  std::optional<raft::Snapshot> load_snapshot();
+  std::vector<pb::LogEntry> recover_log();
+  static ledger::StateMachine initial_ledger(const Genesis& genesis,
+                                             const std::optional<raft::Snapshot>& snap);
+  void check_genesis(const Genesis& genesis);
+  // Snapshots the ledger at its applied index, compacts Raft's log and the WAL.
+  void take_snapshot();
+  // A snapshot from the leader replaces the ledger and the stored log.
+  void install_snapshot(const raft::Snapshot& s);
   void process_ready();
   void apply(const pb::LogEntry& e);
 
@@ -79,15 +102,18 @@ class Node {
   uint64_t ping_seq_ = 0;
   std::map<NodeId, PeerHealth> health_;
 
+  // Raft's durable state. Declared before raft_, which is built from them.
+  std::string data_dir_;
+  storage::MetaStore meta_;
+  storage::Wal wal_;
+  storage::SnapshotStore snaps_;
+  std::optional<raft::Snapshot> boot_snapshot_;  // only during construction
   raft::RaftCore raft_;
-  // Stand-in for the disk until week 5 (MetaStore + WAL). Lost on restart, so
-  // a restarted node comes back at term 0 and simply catches up. Known gap:
-  // forgetting a vote can in theory allow a double vote in one term.
-  raft::HardState hard_state_;
-  std::vector<pb::LogEntry> log_;
-  // The replicated ledger. Volatile until week 5, like the log: after a
-  // restart it is rebuilt from genesis by re-applying committed entries.
+  // The replicated ledger, in memory: after a restart it is rebuilt from the
+  // newest snapshot (or genesis) by re-applying the committed entries after
+  // it (the leader says how far).
   ledger::StateMachine ledger_;
+  LogIndex last_snapshot_index_ = 0;
   // Declared after raft_ and ledger_, which it holds references to.
   server::ClientService service_;
 
