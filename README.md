@@ -264,17 +264,22 @@ Global flags: `--config config/cluster.json`, `--node N`, `--timeout ms`.
 ## Fault Injection & Demos
 
 ```sh
-tools/cluster.py kill 3                 # SIGKILL: simulates a crash
-tools/cluster.py restart 3              # recovers from WAL + snapshot
-tools/cluster.py partition 1,2 3,4,5    # split the network
-tools/cluster.py heal
+tools/faults.py kill leader             # SIGKILL: simulates a crash (or: kill 3)
+tools/faults.py restart 3               # recovers from WAL + snapshot
+tools/faults.py partition 1,2 3,4,5     # split the network
+tools/faults.py isolate leader          # cut one node off
+tools/faults.py heal
+tools/timeline.py                       # all nodes' logs merged by time: watch it unfold
+
+tools/chaos.py --duration 300 --seed 7  # random faults under load, then the checker
+python3 tools/demos/demo_partition.py   # each demo starts its own cluster and checks its claims
 ```
 
 | Demo | What it shows |
 |---|---|
-| **Double spend** (`tools/demos/demo_double_spend.py`) | Two conflicting transfers with the same nonce are sent to different nodes at the same moment, and exactly one commits. Replayed and tampered transactions are rejected. All 5 nodes end with identical state hashes. |
-| **Leader failure** (`tools/demos/demo_leader_failure.py`) | The leader is killed while transfers are running. A new leader is elected, clients retry, and no acknowledged transaction is lost or applied twice. The old leader recovers and catches up. |
-| **Network partition** (`tools/demos/demo_partition.py`) | The leader ends up on the minority side and can't commit. The majority elects a new leader and keeps going. Pre-vote stops terms from inflating. After healing, all nodes converge. |
+| **Double spend** (`tools/demos/demo_double_spend.py`) | Two conflicting transfers with the same nonce are sent to different nodes at the same moment, and exactly one commits. An overdraft fails but still uses its nonce. Resending a payment returns its original result (the money moves once); a tampered one fails `BAD_SIGNATURE`. All 5 nodes end with identical state hashes. |
+| **Leader failure** (`tools/demos/demo_leader_failure.py`) | The leader is killed while transfers are running. A new leader is elected (≈250 ms on localhost), clients retry, and no acknowledged transaction is lost or applied twice (checked by the checker). The old leader recovers from its WAL and catches up. |
+| **Network partition** (`tools/demos/demo_partition.py`) | The leader ends up on the minority side: it accepts a write but can't commit it, and refuses reads rather than risk stale data. The majority elects a new leader and keeps going. After healing, the old leader steps down and its uncommitted write is replaced. Then a follower cut off alone comes back without disturbing the leader (pre-vote). |
 
 ---
 
@@ -285,12 +290,13 @@ tools/cluster.py heal
 | Unit | `tests/unit/` | Framing, connections, peer manager, config, crypto, state machine, WAL |
 | Simulation | `tests/sim/` | Deterministic Raft runs with seeded drops, delays and partitions. Checks election safety, log matching and leader completeness |
 | Integration | `tests/integration/` | Real 5-process clusters on localhost |
-| Consistency | `tools/workload.py` + `tools/checker.py` | Jepsen-style: records a concurrent operation history and checks linearizability and that money is conserved |
-| Chaos | `tools/chaos.py` | Random kills and partitions under load for N minutes |
+| Consistency | `tools/workload.py` + `tools/checker.py` | Jepsen-style: records every client operation (ok / fail / unknown) and checks that every acknowledged transfer is in the ledger exactly once, nothing that failed took effect, an independent Python model of the rules reproduces the balances, money is conserved, and no nonce was spent twice. (It checks acknowledged writes and final state, not the linearizability of reads.) |
+| Chaos | `tools/chaos.py` | Seeded random kills, leader kills, partitions and heals under load for N minutes, then the checker |
 
 ```sh
-ctest --test-dir build                       # unit + simulation tests
-python3 tests/integration/test_network.py    # end-to-end on real processes
+ctest --test-dir build                          # unit + simulation tests
+python3 tests/integration/test_network.py       # end-to-end on real processes (also: election,
+                                                # replication, client, persistence, snapshot, chaos)
 ```
 
 ---

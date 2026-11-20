@@ -1,10 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 
 #include "common/config.h"
@@ -52,6 +54,7 @@ class Node {
   static constexpr uint64_t kUnreachableAfterMs = 500;
 
   Node(ClusterConfig config, NodeId self, const Genesis& genesis);
+  ~Node();
 
   // Blocks until SIGINT/SIGTERM.
   void run();
@@ -72,8 +75,11 @@ class Node {
   static ledger::StateMachine initial_ledger(const Genesis& genesis,
                                              const std::optional<raft::Snapshot>& snap);
   void check_genesis(const Genesis& genesis);
-  // Snapshots the ledger at its applied index, compacts Raft's log and the WAL.
-  void take_snapshot();
+  // Snapshots the ledger at its applied index: Raft gets it (and compacts its
+  // log) at once; the file is written by snap_writer_; the WAL is compacted
+  // once the file is durable (finish_snapshot). `wait` blocks until then.
+  void take_snapshot(bool wait = false);
+  void finish_snapshot();
   // A snapshot from the leader replaces the ledger and the stored log.
   void install_snapshot(const raft::Snapshot& s);
   void process_ready();
@@ -114,6 +120,19 @@ class Node {
   // it (the leader says how far).
   ledger::StateMachine ledger_;
   LogIndex last_snapshot_index_ = 0;
+
+  // The one exception to "everything on one thread": writing a snapshot file.
+  // It is megabytes (the ledger keeps every account's history) and ends in
+  // fsyncs; done on the event loop it blocked heartbeats for 150+ ms and the
+  // followers elected a new leader. The thread only writes an immutable copy
+  // of the bytes; it touches nothing else, and the WAL is compacted on the
+  // event loop after it reports success, so a crash mid-write just means
+  // recovery uses the previous snapshot plus a longer WAL.
+  std::thread snap_writer_;
+  std::atomic<bool> snap_done_{false};
+  bool snap_writing_ = false;
+  std::string snap_error_;  // set by the writer before snap_done_
+  uint64_t snap_started_ms_ = 0;
   // Declared after raft_ and ledger_, which it holds references to.
   server::ClientService service_;
 

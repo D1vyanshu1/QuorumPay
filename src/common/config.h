@@ -24,6 +24,7 @@ struct RaftConfig {
   uint32_t max_entries_per_append = 64;
   uint32_t snapshot_every = 1000;
   std::string fsync = "batch";
+  bool pre_vote = true;
 };
 
 // Loaded from config/cluster.json. Every node gets the identical file and

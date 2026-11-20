@@ -23,6 +23,7 @@ std::unique_ptr<raft::RaftCore> SimCluster::make_core(NodeId id) {
   cfg.election_timeout_max = opts_.election_timeout_max;
   cfg.max_entries_per_append = 8;  // small, so catch-up takes several batches
   cfg.compaction_margin = opts_.compaction_margin;
+  cfg.pre_vote = opts_.pre_vote;
   cfg.snapshot_chunk_bytes = opts_.snapshot_chunk_bytes;
   // Distinct per node and per restart, but fixed by the cluster seed.
   cfg.seed = seed_ * 1000003 + id * 7919 + static_cast<uint64_t>(restarts_);

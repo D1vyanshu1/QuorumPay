@@ -28,6 +28,9 @@ struct SimOptions {
   int election_timeout_min = 15;
   int election_timeout_max = 30;
 
+  // Pre-vote on every node (as in the real node's default config).
+  bool pre_vote = true;
+
   // Snapshots (0 = never): each node snapshots its ledger every this many
   // applied entries, compacts its log, and drops the covered entries from
   // its disk. Small margin and chunks, so InstallSnapshot gets exercised.

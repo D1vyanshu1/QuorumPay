@@ -136,8 +136,10 @@ add_executable(ledger-node
   src/server/main.cpp
   src/server/node.cpp
   src/server/admin_service.cpp)
+find_package(Threads REQUIRED)
 target_link_libraries(ledger-node PRIVATE
-  ledger_server ledger_net ledger_raft ledger_storage ledger_ledger ledger_warnings)
+  ledger_server ledger_net ledger_raft ledger_storage ledger_ledger Threads::Threads
+  ledger_warnings)
 
 add_executable(ledger-cli
   src/client/main.cpp

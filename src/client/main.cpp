@@ -4,7 +4,7 @@
 //   ledger-cli pubkey <name>                  # print a stored public key (hex)
 //   ledger-cli create_account <name>          # keygen if needed, then CREATE_ACCOUNT
 //   ledger-cli fund <name> <amount>           # transfer from the faucet (needs its key)
-//   ledger-cli transfer <from> <to> <amount> [--nonce N]
+//   ledger-cli transfer <from> <to> <amount> [--nonce N] [--tamper N]
 //   ledger-cli balance <name> [--stale]       # linearizable unless --stale
 //   ledger-cli history <name> [--limit N] [--stale]
 //   ledger-cli tx <tx_id> [--stale]
@@ -22,6 +22,9 @@
 // --nonce skips the nonce lookup. Normally the CLI reads the sender's next
 // nonce first (a linearizable read); the demos use --nonce to send two
 // different transfers with the same nonce (a double spend).
+// --tamper N (demos only) signs the transfer, then changes its amount to N
+// before sending: what an attacker who intercepted it would try. The
+// signature no longer matches, so the cluster refuses it (BAD_SIGNATURE).
 
 #include <cstdint>
 #include <exception>
@@ -63,6 +66,7 @@ struct Options {
   bool stale = false;
   uint64_t limit = 0;
   std::optional<uint64_t> nonce;
+  std::optional<uint64_t> tamper;
   std::vector<std::string> args;
 };
 
@@ -70,7 +74,7 @@ int usage() {
   std::cerr <<
       "usage: ledger-cli [--config F] [--genesis F] [--node N] [--timeout MS] [--keys-dir D]\n"
       "         keygen <name> | pubkey <name> | create_account <name>\n"
-      "       | fund <name> <amount> | transfer <from> <to> <amount> [--nonce N]\n"
+      "       | fund <name> <amount> | transfer <from> <to> <amount> [--nonce N] [--tamper N]\n"
       "       | balance <name> [--stale] | history <name> [--limit N] [--stale]\n"
       "       | tx <tx_id> [--stale] | status\n";
   return kExitUsage;
@@ -117,6 +121,9 @@ bool parse_args(int argc, char** argv, Options* o) {
     } else if (a == "--nonce") {
       if (!value(&v) || !parse_u64(v, &n)) return false;
       o->nonce = n;
+    } else if (a == "--tamper") {
+      if (!value(&v) || !parse_u64(v, &n)) return false;
+      o->tamper = n;
     } else if (a == "--stale") {
       o->stale = true;
     } else if (a == "--all") {
@@ -177,6 +184,7 @@ class Cli {
     t.amount = amount;
     t.nonce = nonce;
     t.sign(kp);
+    if (o_.tamper) t.amount = *o_.tamper;  // after signing: the signature no longer fits
     return submit(t);
   }
 
@@ -289,13 +297,13 @@ class Cli {
       resp = client_.call(req);
     } catch (const ledger::client::TimeoutError& e) {
       // It may or may not have committed: say so, with the id to look it up.
-      print({{"tx_id", tx_id}, {"status", "UNKNOWN"}, {"error", e.what()}});
+      print({{"tx_id", tx_id}, {"nonce", t.nonce}, {"status", "UNKNOWN"}, {"error", e.what()}});
       return kExitError;
     }
     if (!resp.has_submit_tx_resp()) throw std::runtime_error("unexpected reply");
     const auto& r = resp.submit_tx_resp();
     const auto status = static_cast<TxStatus>(r.tx_status());
-    json out = {{"tx_id", tx_id}, {"status", ledger::tx_status_name(status)}};
+    json out = {{"tx_id", tx_id}, {"nonce", t.nonce}, {"status", ledger::tx_status_name(status)}};
     if (r.code() == pb::RESP_OK) {
       out["index"] = r.log_index();
     } else {

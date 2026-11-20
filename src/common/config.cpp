@@ -84,6 +84,7 @@ ClusterConfig ClusterConfig::parse(const std::string& json_text) {
           parse_u32(r, "max_entries_per_append", c.raft.max_entries_per_append);
       c.raft.snapshot_every = parse_u32(r, "snapshot_every", c.raft.snapshot_every);
       c.raft.fsync = r.value("fsync", c.raft.fsync);
+      c.raft.pre_vote = r.value("pre_vote", c.raft.pre_vote);
     }
   } catch (const nlohmann::json::exception& e) {
     fail(e.what());

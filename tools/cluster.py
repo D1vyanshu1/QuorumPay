@@ -112,8 +112,8 @@ class Cluster:
     def kill(self, ids=None):
         self._signal(ids, signal.SIGKILL, "killed")
 
-    def wipe(self, ids=None):
-        """Deletes the Raft state of stopped nodes (keeps node.log)."""
+    def wipe(self, ids=None, keep_log=True):
+        """Deletes the Raft state of stopped nodes (and node.log unless keep_log)."""
         for nid in ids or self.nodes:
             if self.is_running(nid):
                 raise RuntimeError(f"node {nid} is running: stop it before wiping")
@@ -121,7 +121,7 @@ class Cluster:
             if not os.path.isdir(d):
                 continue
             for name in os.listdir(d):
-                if name == "node.log":
+                if name == "node.log" and keep_log:
                     continue
                 p = os.path.join(d, name)
                 shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
@@ -192,6 +192,46 @@ class Cluster:
         for nid in ids or self.nodes:
             if self.is_running(nid):
                 self.admin(nid, "unblock-all")
+
+    def isolate(self, nid):
+        """Cut `nid` off from everyone (a 1 | 4 partition)."""
+        self.partition([nid], [n for n in self.nodes if n != nid])
+
+    def running(self):
+        return [n for n in self.nodes if self.is_running(n)]
+
+    # ------------------------------------------------------------ waiting
+    def wait_leader(self, timeout=10.0):
+        """The leader that every running node agrees on (polls until one exists)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                views = {self.status(n)["leader"] for n in self.running()}
+                if len(views) == 1 and 0 not in views:
+                    return views.pop()
+            except Exception:  # noqa: BLE001 - a node may be mid-restart
+                pass
+            time.sleep(0.1)
+        raise TimeoutError(f"no agreed leader within {timeout}s")
+
+    def wait_converged(self, timeout=15.0):
+        """Waits until every running node has applied the leader's whole log
+        and holds the same state. Returns that node status."""
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            try:
+                lead = self.wait_leader(max(0.1, deadline - time.time()))
+                target = self.status(lead)["last_log_index"]
+                st = [self.status(n) for n in self.running()]
+                views = {(s["applied_index"], s["state_hash"]) for s in st}
+                if len(views) == 1 and st[0]["applied_index"] == target:
+                    return st[0]
+                last = views
+            except Exception as e:  # noqa: BLE001
+                last = e
+            time.sleep(0.1)
+        raise TimeoutError(f"nodes didn't converge within {timeout}s (last: {last})")
 
 
 def print_status(cluster):

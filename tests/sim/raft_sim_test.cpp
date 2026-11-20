@@ -133,6 +133,10 @@ TEST(RaftSim, FixedTimeoutsSplitVoteForever) {
   SimOptions opts;
   opts.election_timeout_min = 20;
   opts.election_timeout_max = 20;
+  // Plain Raft. With pre-vote, the extra round trip (random message delays)
+  // happens to stagger when nodes become candidates and breaks the tie, which
+  // would hide the point of this test.
+  opts.pre_vote = false;
   SimCluster c(5, 1, opts);
   c.run(2000);
   EXPECT_TRUE(c.leaders().empty());
@@ -725,4 +729,47 @@ TEST(RaftSim, LedgerStaysConsistentWithSnapshotsUnderRandomFaults) {
   size_t ok_total = 0;
   ledger_chaos(opts, 100, &ok_total);
   EXPECT_GT(ok_total, 500u);
+}
+
+// ---------------------------------------------------------------- pre-vote
+
+TEST(RaftSim, PreVoteStopsAnIsolatedNodeFromDisruptingTheLeader) {
+  // A follower is cut off alone for ~20 election timeouts, then comes back.
+  // Without pre-vote it keeps starting elections, its term races ahead, and
+  // when it returns that higher term deposes the healthy leader. With
+  // pre-vote it only asks "would you vote for me?", nobody can answer, its
+  // term never moves, and the leader isn't disturbed.
+  int disrupted[2] = {0, 0};  // [without, with] pre-vote
+  for (bool pre_vote : {false, true}) {
+    for (uint64_t seed = 1; seed <= 100; ++seed) {
+      SimOptions opts;
+      opts.pre_vote = pre_vote;
+      SimCluster c(5, seed, opts);
+      ASSERT_NE(c.run_until_leader(300), -1);
+      c.run(20);  // let the no-op reach everyone
+      const NodeId leader = c.leaders()[0];
+      const Term term = c.node(leader).term();
+      const NodeId lone = leader == 1 ? 2 : 1;
+      std::vector<NodeId> rest;
+      for (NodeId id : c.ids())
+        if (id != lone) rest.push_back(id);
+
+      c.partition({{lone}, rest});
+      c.run(500);
+      if (pre_vote) {
+        EXPECT_EQ(c.node(lone).term(), term) << "seed " << seed;  // never even ran
+      } else {
+        EXPECT_GT(c.node(lone).term(), term + 5) << "seed " << seed;
+      }
+      c.heal();
+      c.run(300);
+      const bool moved = c.stable_leader(c.ids()) != leader || c.node(leader).term() != term;
+      disrupted[pre_vote] += moved;
+      expect_safe(c);
+    }
+  }
+  EXPECT_EQ(disrupted[1], 0);   // with pre-vote: never
+  EXPECT_GT(disrupted[0], 50);  // without: the comeback usually deposes the leader
+  std::cout << "leader deposed by a returning node: without pre-vote " << disrupted[0]
+            << "/100, with pre-vote " << disrupted[1] << "/100\n";
 }

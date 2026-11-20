@@ -16,16 +16,16 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import threading
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
-from cluster import REPO, Cluster  # noqa: E402
-from test_client import SUPPLY, Cli, converged  # noqa: E402
-from test_election import agreed_leader, wait_leader  # noqa: E402
+from cluster import Cluster  # noqa: E402
+from ledger_cli import Cli, make_genesis  # noqa: E402
+from test_client import SUPPLY, converged  # noqa: E402
+from test_election import wait_leader  # noqa: E402
 from test_network import wait_for  # noqa: E402
 
 
@@ -49,13 +49,8 @@ def main():
     args = ap.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="ledger-test-")
-    keys = os.path.join(tmp, "keys")
-    genesis = os.path.join(tmp, "genesis.json")
+    keys, genesis = make_genesis(tmp, args.build_dir, SUPPLY)
     cli = Cli(args.build_dir, keys, genesis)
-    cli.ok("keygen", "faucet")
-    subprocess.run([sys.executable, os.path.join(REPO, "tools", "make_genesis.py"),
-                    "--faucet-key", os.path.join(keys, "faucet.key"),
-                    "--supply", str(SUPPLY), "--out", genesis], check=True, capture_output=True)
 
     c = Cluster(build_dir=args.build_dir, genesis=genesis)
     ids = sorted(c.nodes)

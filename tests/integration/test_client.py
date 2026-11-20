@@ -25,42 +25,11 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
 from cluster import REPO, Cluster  # noqa: E402
+from ledger_cli import Cli, make_genesis  # noqa: E402
 from test_election import agreed_leader, wait_leader  # noqa: E402
 from test_network import wait_for  # noqa: E402
 
 SUPPLY = 1_000_000
-
-
-class Cli:
-    def __init__(self, build_dir, keys_dir, genesis):
-        self.exe = os.path.join(REPO, build_dir, "ledger-cli")
-        self.keys_dir = keys_dir
-        self.genesis = genesis
-
-    def cmd(self, *args, node=None, keys_dir=None, timeout_ms=10000):
-        c = [self.exe, "--keys-dir", keys_dir or self.keys_dir, "--genesis", self.genesis,
-             "--timeout", str(timeout_ms)]
-        if node:
-            c += ["--node", str(node)]
-        return c + [str(a) for a in args]
-
-    def run(self, *args, **kw):
-        """(exit code, parsed JSON reply)"""
-        out = subprocess.run(self.cmd(*args, **kw), cwd=REPO, capture_output=True, text=True,
-                             timeout=30)
-        try:
-            reply = json.loads(out.stdout.strip().splitlines()[-1])
-        except (IndexError, json.JSONDecodeError):
-            reply = {"stderr": out.stderr.strip()}
-        return out.returncode, reply
-
-    def ok(self, *args, **kw):
-        rc, r = self.run(*args, **kw)
-        assert rc == 0, f"{args}: exit {rc}, {r}"
-        return r
-
-    def balance(self, name, **kw):
-        return self.ok("balance", name, **kw)
 
 
 def converged(c, ids):
@@ -87,13 +56,8 @@ def main():
     args = ap.parse_args()
 
     tmp = tempfile.mkdtemp(prefix="ledger-test-")
-    keys = os.path.join(tmp, "keys")
-    genesis = os.path.join(tmp, "genesis.json")
+    keys, genesis = make_genesis(tmp, args.build_dir, SUPPLY)
     cli = Cli(args.build_dir, keys, genesis)
-    cli.ok("keygen", "faucet")
-    subprocess.run([sys.executable, os.path.join(REPO, "tools", "make_genesis.py"),
-                    "--faucet-key", os.path.join(keys, "faucet.key"),
-                    "--supply", str(SUPPLY), "--out", genesis], check=True, capture_output=True)
 
     c = Cluster(build_dir=args.build_dir, genesis=genesis)
     ids = sorted(c.nodes)

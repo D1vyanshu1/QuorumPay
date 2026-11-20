@@ -17,7 +17,9 @@
 
 namespace ledger::raft {
 
-enum class Role { kFollower, kCandidate, kLeader };
+// kPreCandidate: asking "would you vote for me?" before a real election
+// (pre-vote, Raft thesis §9.6). Its term and vote are unchanged.
+enum class Role { kFollower, kPreCandidate, kCandidate, kLeader };
 
 const char* role_name(Role r);
 
@@ -37,6 +39,12 @@ struct RaftConfig {
   LogIndex compaction_margin = 100;
   // InstallSnapshot sends the snapshot in pieces of at most this size.
   size_t snapshot_chunk_bytes = 1 << 20;
+  // Pre-vote (thesis §9.6): on an election timeout, first ask a majority
+  // whether they would vote for us, without touching our term. A node that
+  // was cut off then can't bump its term and depose a healthy leader when it
+  // comes back, because nodes that still hear the leader say no. Off here so
+  // hand-driven tests see plain elections; the node and the simulator turn it on.
+  bool pre_vote = false;
 
   // Seeds the election-timeout RNG. Injected so simulations are reproducible.
   uint64_t seed = 0;
@@ -61,7 +69,7 @@ struct ProposeResult {
 //
 // Implemented: leader election, log replication with fast backtracking,
 // the commit rule, committed entries for the host to apply, ReadIndex, and
-// snapshots (compact() + InstallSnapshot). Still to come: pre-vote (week 6).
+// snapshots (compact() + InstallSnapshot), and pre-vote.
 class RaftCore {
  public:
   // `hard_state`, `log` and `snapshot` are what the host recovered from disk
@@ -104,6 +112,7 @@ class RaftCore {
 
  private:
   void become_follower(Term term, NodeId leader);
+  void become_pre_candidate();
   void become_candidate();
   void become_leader();
 
@@ -134,7 +143,9 @@ class RaftCore {
   // Queues an entry for the host to store, replacing any queued entries at
   // the same index or later (see Ready::entries).
   void queue_persist(const pb::LogEntry& e);
-  void send(NodeId to, pb::RaftMessage msg);
+  // `term` overrides our current term in the message (pre-vote messages carry
+  // the term the election WOULD have).
+  void send(NodeId to, pb::RaftMessage msg, Term term = 0);
   void reset_election_timer();
   size_t quorum() const { return (config_.peers.size() + 1) / 2 + 1; }
 

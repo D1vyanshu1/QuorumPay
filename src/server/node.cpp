@@ -125,6 +125,7 @@ raft::RaftConfig Node::make_raft_config() const {
   rc.election_timeout_max = static_cast<int>(config_.raft.election_ticks_max);
   rc.heartbeat_interval = static_cast<int>(config_.raft.heartbeat_ticks);
   rc.max_entries_per_append = config_.raft.max_entries_per_append;
+  rc.pre_vote = config_.raft.pre_vote;
   // Real nodes want different timeouts on every run; only the simulator needs
   // reproducible seeds.
   rc.seed = (static_cast<uint64_t>(std::random_device{}()) << 32) ^ self_;
@@ -183,6 +184,7 @@ void Node::on_tick() {
   peers_.tick(now);
   if (tick_count_ % config_.raft.heartbeat_ticks == 0) send_pings();
   update_reachability(now);
+  if (snap_writing_ && snap_done_.load(std::memory_order_acquire)) finish_snapshot();
 
   raft_.tick();
 }
@@ -240,27 +242,59 @@ void Node::process_ready() {
   }
 }
 
-void Node::take_snapshot() {
+Node::~Node() {
+  if (snap_writer_.joinable()) snap_writer_.join();
+}
+
+void Node::take_snapshot(bool wait) {
+  if (snap_writing_) {
+    if (!wait) return;  // one at a time; the trigger fires again later
+    finish_snapshot();
+  }
   const LogIndex index = ledger_.last_applied();
-  if (index <= last_snapshot_index_) return;
-  raft_.compact(index, ledger_.snapshot());
-  const raft::Snapshot& s = *raft_.snapshot();
-  // Durable first; only then may the log entries it covers go.
-  snaps_.save(storage::SnapshotFile{s.index, s.term, s.data});
-  // Compact the WAL only up to the OLDER of the kept snapshots: if the newest
-  // file turns out to be damaged, recovery falls back to the older one and
-  // still needs the entries after it.
+  if (index > last_snapshot_index_) {
+    snap_started_ms_ = now_ms();
+    // Serializing is the only slow part left on the event loop (a few ms).
+    raft_.compact(index, ledger_.snapshot());
+    const raft::Snapshot& s = *raft_.snapshot();
+    last_snapshot_index_ = index;
+    snap_done_.store(false);
+    snap_writing_ = true;
+    snap_writer_ = std::thread([this, f = storage::SnapshotFile{s.index, s.term, s.data}] {
+      try {
+        snaps_.save(f);  // checksum + write + fsync + rename + dir fsync
+      } catch (const std::exception& e) {
+        snap_error_ = e.what();
+      }
+      snap_done_.store(true, std::memory_order_release);
+    });
+  }
+  if (wait && snap_writing_) finish_snapshot();
+}
+
+void Node::finish_snapshot() {
+  snap_writer_.join();
+  snap_writing_ = false;
+  if (!snap_error_.empty()) throw std::runtime_error("snapshot write failed: " + snap_error_);
+  // The file is durable: only now may log entries it covers go. Compact the
+  // WAL only up to the OLDER of the kept snapshots: if the newest file turns
+  // out to be damaged, recovery falls back to the older one and still needs
+  // the entries after it.
   auto kept = snaps_.list();
   if (kept.size() >= 2) wal_.compact_through(kept[1]);
-  last_snapshot_index_ = index;
-  log_info("snapshot_taken", {{"index", s.index},
+  const raft::Snapshot& s = *raft_.snapshot();
+  log_info("snapshot_taken", {{"index", last_snapshot_index_},
                               {"term", s.term},
                               {"bytes", s.data.size()},
+                              {"ms", now_ms() - snap_started_ms_},
                               {"log_first_index", raft_.log().snapshot_index() + 1},
                               {"wal_first_index", wal_.first_index()}});
 }
 
 void Node::install_snapshot(const raft::Snapshot& s) {
+  if (snap_writing_) finish_snapshot();  // one writer of snap/ at a time
+  // Synchronous on purpose: the ack that follows promises we have it. Rare
+  // (only a follower that fell far behind).
   snaps_.save(storage::SnapshotFile{s.index, s.term, s.data});
   // The stored log is replaced: the entries Raft kept after the snapshot (if
   // any) arrive in this same Ready's entries and are written next.
@@ -396,7 +430,7 @@ pb::Envelope Node::handle_admin(const pb::Envelope& req) {
       ok();
       break;
     case pb::Envelope::kTakeSnapshot:
-      take_snapshot();
+      take_snapshot(/*wait=*/true);  // the reply means: it's on disk
       ok();
       break;
     case pb::Envelope::kUnblockAll:

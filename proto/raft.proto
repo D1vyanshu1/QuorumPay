@@ -22,7 +22,7 @@ message LogEntry {
 message RequestVote {
   uint64 last_log_index = 1;
   uint64 last_log_term = 2;
-  bool pre_vote = 3;  // reserved for pre-vote (week 6)
+  bool pre_vote = 3;  // "would you vote for me?" (term = the term it would use)
 }
 
 message RequestVoteResp {

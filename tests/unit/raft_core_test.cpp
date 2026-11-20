@@ -561,3 +561,121 @@ TEST(RaftCore, SingleNodeServesReadImmediately) {
   ASSERT_TRUE(r.read_index(7));
   EXPECT_EQ(r.ready().reads_ready.size(), 1u);
 }
+
+// ---------------------------------------------------------------- pre-vote
+
+namespace {
+
+RaftCore pre_vote_node(HardState hs = {}, std::vector<ledger::pb::LogEntry> log = {}) {
+  RaftConfig c = config(1, {2, 3, 4, 5});
+  c.pre_vote = true;
+  return RaftCore(c, hs, std::move(log));
+}
+
+RaftMessage pre_vote_request(NodeId from, Term term, uint64_t last_index = 0, Term last_term = 0) {
+  RaftMessage m = request_vote(from, term, last_index, last_term);
+  m.mutable_request_vote()->set_pre_vote(true);
+  return m;
+}
+
+RaftMessage pre_vote_resp(NodeId from, Term term, bool granted) {
+  RaftMessage m = vote_resp(from, term, granted);
+  m.mutable_request_vote_resp()->set_pre_vote(true);
+  return m;
+}
+
+void tick_until_not_follower(RaftCore& r) {
+  for (int i = 0; i < 100 && r.role() == Role::kFollower; ++i) r.tick();
+}
+
+}  // namespace
+
+TEST(RaftCore, PreVoteTimeoutChangesNoTermAndNoVote) {
+  RaftCore r = pre_vote_node(HardState{3, 0});
+  tick_until_not_follower(r);
+  EXPECT_EQ(r.role(), Role::kPreCandidate);
+  EXPECT_EQ(r.term(), 3u);
+  EXPECT_EQ(r.voted_for(), ledger::kNoNode);
+  Ready rd = r.ready();
+  EXPECT_FALSE(rd.hard_state.has_value());  // nothing to persist, no fsync
+  ASSERT_EQ(rd.messages.size(), 4u);
+  for (const auto& m : rd.messages) {
+    EXPECT_TRUE(m.request_vote().pre_vote());
+    EXPECT_EQ(m.term(), 4u);  // the term the election WOULD use
+  }
+}
+
+TEST(RaftCore, PreVoteMajorityStartsTheRealElection) {
+  RaftCore r = pre_vote_node(HardState{3, 0});
+  tick_until_not_follower(r);
+  r.ready();
+  r.step(pre_vote_resp(2, 4, true));
+  EXPECT_EQ(r.role(), Role::kPreCandidate);  // 2 of 5 so far
+  r.step(pre_vote_resp(3, 4, true));
+  EXPECT_EQ(r.role(), Role::kCandidate);
+  EXPECT_EQ(r.term(), 4u);
+  EXPECT_EQ(r.voted_for(), 1u);
+  Ready rd = r.ready();
+  ASSERT_EQ(rd.messages.size(), 4u);
+  for (const auto& m : rd.messages) EXPECT_FALSE(m.request_vote().pre_vote());
+}
+
+TEST(RaftCore, PreVoteRefusedWhileTheLeaderIsAlive) {
+  RaftCore r = pre_vote_node();
+  r.step(heartbeat(2, 1));  // leader 2 just spoke
+  r.ready();
+  r.step(pre_vote_request(3, 2));
+  RaftMessage reply = only_message(r);
+  EXPECT_FALSE(reply.request_vote_resp().granted());
+  EXPECT_EQ(reply.term(), 1u);
+  // And answering changed nothing.
+  EXPECT_EQ(r.term(), 1u);
+  EXPECT_EQ(r.leader(), 2u);
+  EXPECT_EQ(r.voted_for(), ledger::kNoNode);
+}
+
+TEST(RaftCore, PreVoteGrantedOnceTheLeaderWentQuiet) {
+  RaftCore r = pre_vote_node();
+  r.step(heartbeat(2, 1));
+  r.ready();
+  for (int i = 0; i < 15; ++i) r.tick();  // a minimum election timeout of silence
+  r.ready();
+  r.step(pre_vote_request(3, 2));
+  RaftMessage reply = only_message(r);
+  EXPECT_TRUE(reply.request_vote_resp().granted());
+  EXPECT_EQ(reply.term(), 2u);  // echoes the proposed term
+  EXPECT_EQ(r.term(), 1u);      // but ours didn't move
+  EXPECT_EQ(r.voted_for(), ledger::kNoNode);
+}
+
+TEST(RaftCore, PreVoteRefusedForAStaleLog) {
+  ledger::pb::LogEntry e;
+  e.set_index(1);
+  e.set_term(1);
+  RaftCore r = pre_vote_node(HardState{1, 0}, {e});
+  r.step(pre_vote_request(3, 2, /*last_index=*/0, /*last_term=*/0));
+  EXPECT_FALSE(only_message(r).request_vote_resp().granted());
+}
+
+TEST(RaftCore, PreVoteRefusalWithAHigherTermStepsDown) {
+  RaftCore r = pre_vote_node(HardState{3, 0});
+  tick_until_not_follower(r);
+  r.ready();
+  r.step(pre_vote_resp(2, 9, false));  // node 2 is far ahead
+  EXPECT_EQ(r.role(), Role::kFollower);
+  EXPECT_EQ(r.term(), 9u);
+}
+
+TEST(RaftCore, GrantedPreVoteWithAHigherTermDoesNotDeposeALeader) {
+  // A leader that receives a pre-vote request for a higher term must not
+  // step down: that request is exactly the disruption pre-vote prevents.
+  RaftCore r = five_node();
+  tick_until_candidate(r);
+  for (NodeId p : {2, 3}) r.step(vote_resp(p, 1, true));
+  ASSERT_EQ(r.role(), Role::kLeader);
+  r.ready();
+  r.step(pre_vote_request(4, 5));
+  EXPECT_EQ(r.role(), Role::kLeader);
+  EXPECT_EQ(r.term(), 1u);
+  EXPECT_FALSE(only_message(r).request_vote_resp().granted());
+}

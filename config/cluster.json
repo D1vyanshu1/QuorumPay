@@ -14,6 +14,7 @@
     "heartbeat_ticks": 5,
     "max_entries_per_append": 64,
     "snapshot_every": 1000,
-    "fsync": "batch"
+    "fsync": "batch",
+    "pre_vote": true
   }
 }

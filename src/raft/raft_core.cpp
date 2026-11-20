@@ -11,6 +11,8 @@ const char* role_name(Role r) {
   switch (r) {
     case Role::kFollower:
       return "follower";
+    case Role::kPreCandidate:
+      return "pre-candidate";
     case Role::kCandidate:
       return "candidate";
     case Role::kLeader:
@@ -58,17 +60,32 @@ void RaftCore::tick() {
     }
     return;
   }
-  // Follower or candidate: no word from a leader for a whole timeout, so start
-  // an election. A candidate whose election split also lands here and retries
-  // with a new term and a fresh random timeout.
-  if (++election_elapsed_ >= election_timeout_) become_candidate();
+  // No word from a leader for a whole timeout, so start an election (with
+  // pre-vote: first ask whether we could win one). A candidate whose election
+  // split also lands here and retries with a fresh random timeout.
+  if (++election_elapsed_ >= election_timeout_) {
+    if (config_.pre_vote) {
+      become_pre_candidate();
+    } else {
+      become_candidate();
+    }
+  }
 }
 
 void RaftCore::step(const pb::RaftMessage& msg) {
   // Rule for all servers (Figure 2): a higher term means our term is stale.
   // Step down before handling the message. An AppendEntries can only come
   // from the leader of that term, so we learn the leader too.
-  if (msg.term() > term_) {
+  //
+  // Except pre-vote traffic: a pre-vote request carries the term its sender
+  // WOULD use, and a granted answer echoes it. Neither means a newer term
+  // exists, so stepping down for them would cause exactly the disruption
+  // pre-vote exists to prevent. (A refusal carries the refuser's real term.)
+  const bool pre_vote_term =
+      (msg.has_request_vote() && msg.request_vote().pre_vote()) ||
+      (msg.has_request_vote_resp() && msg.request_vote_resp().pre_vote() &&
+       msg.request_vote_resp().granted());
+  if (msg.term() > term_ && !pre_vote_term) {
     NodeId leader = msg.has_append_entries() || msg.has_install_snapshot() ? msg.from() : kNoNode;
     become_follower(msg.term(), leader);
   }
@@ -146,6 +163,28 @@ void RaftCore::become_follower(Term term, NodeId leader) {
   reset_election_timer();
 }
 
+void RaftCore::become_pre_candidate() {
+  // Nothing durable changes: no new term, no vote. If nobody answers (we're
+  // cut off), we just time out and ask again, at the same term.
+  role_ = Role::kPreCandidate;
+  leader_ = kNoNode;
+  votes_ = {config_.id};
+  reset_election_timer();
+
+  if (votes_.size() >= quorum()) {  // single-node cluster
+    become_candidate();
+    return;
+  }
+  for (NodeId peer : config_.peers) {
+    pb::RaftMessage m;
+    auto* rv = m.mutable_request_vote();
+    rv->set_last_log_index(log_.last_index());
+    rv->set_last_log_term(log_.last_term());
+    rv->set_pre_vote(true);
+    send(peer, std::move(m), term_ + 1);
+  }
+}
+
 void RaftCore::become_candidate() {
   role_ = Role::kCandidate;
   ++term_;
@@ -188,6 +227,25 @@ void RaftCore::become_leader() {
 
 void RaftCore::handle_request_vote(const pb::RaftMessage& msg) {
   const auto& rv = msg.request_vote();
+  if (rv.pre_vote()) {
+    // "Would you vote for me in term msg.term()?" Yes only if that term is
+    // newer than ours, its log is up to date, and we haven't heard from a
+    // leader for a minimum election timeout. The last condition is the point:
+    // while a leader is alive and reaching us, nobody can start an election.
+    // Answering changes nothing: no term, no vote, no timer reset.
+    const bool leader_alive =
+        role_ == Role::kLeader ||
+        (leader_ != kNoNode && election_elapsed_ < config_.election_timeout_min);
+    const bool grant = msg.term() > term_ && !leader_alive &&
+                       log_.is_up_to_date(rv.last_log_index(), rv.last_log_term());
+    pb::RaftMessage reply;
+    reply.mutable_request_vote_resp()->set_granted(grant);
+    reply.mutable_request_vote_resp()->set_pre_vote(true);
+    // A yes echoes the proposed term; a no carries ours, which makes a
+    // pre-candidate behind on terms catch up.
+    send(msg.from(), std::move(reply), grant ? msg.term() : 0);
+    return;
+  }
   // After the step-down in step(), msg.term() <= term_. A lower term is a
   // stale candidate: refuse, and our term in the reply tells it to step down.
   bool grant = msg.term() == term_ &&
@@ -206,6 +264,15 @@ void RaftCore::handle_request_vote(const pb::RaftMessage& msg) {
 }
 
 void RaftCore::handle_request_vote_resp(const pb::RaftMessage& msg) {
+  if (msg.request_vote_resp().pre_vote()) {
+    // Yes votes echo the term we proposed (ours + 1). A no with a higher
+    // term already made us a follower in step().
+    if (role_ != Role::kPreCandidate || msg.term() != term_ + 1) return;
+    if (!msg.request_vote_resp().granted()) return;
+    votes_.insert(msg.from());
+    if (votes_.size() >= quorum()) become_candidate();  // now a real election
+    return;
+  }
   // Ignore late replies from an older election, or replies after we already
   // won or lost this one.
   if (role_ != Role::kCandidate || msg.term() != term_) return;
@@ -523,10 +590,10 @@ void RaftCore::queue_persist(const pb::LogEntry& e) {
   q.push_back(e);
 }
 
-void RaftCore::send(NodeId to, pb::RaftMessage msg) {
+void RaftCore::send(NodeId to, pb::RaftMessage msg, Term term) {
   msg.set_from(config_.id);
   msg.set_to(to);
-  msg.set_term(term_);
+  msg.set_term(term != 0 ? term : term_);
   pending_.messages.push_back(std::move(msg));
 }
 
